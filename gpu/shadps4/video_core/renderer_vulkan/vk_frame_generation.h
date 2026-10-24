@@ -43,13 +43,29 @@ public:
 
     /// Switched on in the settings (BbSettings::frame_gen), with a provider that can run.
     [[nodiscard]] bool Wanted() const;
+    /// The inputs are taken: for frame generation or for stereo 3D (vk_stereo.h).
+    [[nodiscard]] bool Capturing() const;
 
     /// At the upscaler's trigger, render size `w` x `h`: records the copy of the scene depth
     /// (depth aspect view, sampled in General layout) and returns the motion vector image to
     /// write next (RG16F storage, General: pixels, previous minus current), or null when off.
     vk::ImageView BeginCapture(vk::CommandBuffer cmdbuf, vk::ImageView depth, u32 w, u32 h);
-    /// After the motion vectors are written. `motion_valid` false: they are zero this frame.
-    void EndCapture(vk::CommandBuffer cmdbuf, std::array<float, 2> jitter, bool motion_valid);
+    /// After the motion vectors are written. `motion_valid` false: they are zero this frame,
+    /// and there is no camera. `depth_to_z`: view z = [1] / (depth - [0]) (CameraMotion).
+    void EndCapture(vk::CommandBuffer cmdbuf, std::array<float, 2> jitter, bool motion_valid,
+                    std::array<float, 2> depth_to_z);
+
+    /// This frame's scene for stereo 3D.
+    struct StereoScene {
+        vk::ImageView depth; ///< R32F hardware depth (General); null without the scene
+        u32 width = 0, height = 0;
+        std::array<float, 2> depth_to_z{};
+    };
+    /// Empty for frames without a capture (menus, movies) or without the game's camera.
+    [[nodiscard]] StereoScene Scene() const;
+    /// Stereo 3D without frame generation: this frame's captures are used up (Generate does
+    /// it otherwise).
+    void FinishFrame();
 
     /// The game's picture before its UI (`source`, TransferSrcOptimal layout): copied.
     void CaptureHudless(vk::CommandBuffer cmdbuf, vk::Image source, vk::Format format, u32 w,
@@ -116,6 +132,8 @@ private:
 
     bool captured = false; ///< BeginCapture ran since the last Generate
     std::array<float, 2> capture_jitter{};
+    std::array<float, 2> capture_depth_to_z{};
+    bool capture_camera = false; ///< the capture has the game's camera
     bool reset = true;
     int last_provider = 0;
     bool last_hudless = false;

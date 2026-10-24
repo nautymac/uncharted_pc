@@ -18,6 +18,8 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_sr_output.h"
+#include "video_core/renderer_vulkan/vk_stereo.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -162,6 +164,10 @@ private:
     std::unique_ptr<FrameGenerator> frame_generator;
     /// The game's picture before its UI, through the same passes as the frame.
     Frame hudless_frame{};
+    /// bbport: stereo 3D, the two eyes side by side in the frame (instead of frame generation).
+    std::unique_ptr<Stereo> stereo;
+    /// bbport: the side-by-side picture woven for an SR panel at the present (present thread).
+    std::unique_ptr<SrOutput> sr_output;
     std::chrono::steady_clock::time_point last_game_present{};
     std::atomic<double> game_frame_ms{16.7}; ///< written by the present thread
 };

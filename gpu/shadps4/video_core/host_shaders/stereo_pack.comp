@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: stereo 3D on alternate frames (vk_stereo.h): the last left-eye and right-eye frames the
+// game rendered, side by side, each squeezed to half the width.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D left_tex;
+layout(binding = 1) uniform sampler2D right_tex;
+layout(binding = 2, rgba8) uniform writeonly image2D out_img;
+
+layout(push_constant) uniform Constants {
+    ivec2 out_size;
+    uint flags; // 1: swap eyes
+};
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= out_size.x || pixel.y >= out_size.y) {
+        return;
+    }
+    const int half_width = out_size.x / 2;
+    bool right = pixel.x >= half_width;
+    if ((flags & 1u) != 0u) {
+        right = !right;
+    }
+    const vec2 uv = vec2((float(pixel.x >= half_width ? pixel.x - half_width : pixel.x) + 0.5) / float(half_width),
+                         (float(pixel.y) + 0.5) / float(out_size.y));
+    const vec3 color = right ? textureLod(right_tex, uv, 0.0).rgb : textureLod(left_tex, uv, 0.0).rgb;
+    imageStore(out_img, pixel, vec4(color, 1.0));
+}

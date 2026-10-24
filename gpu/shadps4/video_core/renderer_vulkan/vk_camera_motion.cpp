@@ -262,6 +262,52 @@ extern "C" int bbgpu_camera_yaw(float* yaw_degrees, double* age_seconds) {
     return 1;
 }
 
+#ifdef _WIN32
+extern "C" void runtime_find_camera_writers(const float* c); // probe.c, BB_FIND_CAMERA
+#endif
+
+// bbport stereo 3D on alternate frames: the camera hook (runtime_pad.c) turns the game's camera
+// onto each eye before a frame is rendered and records the eye's right axis here; the frame's
+// velocity pass carries that axis (column 0 of its view-to-world rotation), which tells the
+// presenter which eye the frame is. The two eyes' axes differ by the toe-in angle (about a
+// degree), far beyond the rounding of the game's own matrix inversion.
+namespace {
+struct EyeAxis {
+    float axis[3];
+    int eye; // 1 left, 2 right
+};
+std::array<EyeAxis, 16> eye_axes{};
+std::atomic<u32> eye_axes_head{0};
+std::atomic<int> frame_eye{0}; ///< the eye of the last velocity pass seen, 0 unknown
+std::atomic<u32> eye_misses{0};
+} // namespace
+
+extern "C" void bbgpu_stereo_eye_axis(int eye, float x, float y, float z) {
+    const u32 at = eye_axes_head.fetch_add(1, std::memory_order_relaxed) % eye_axes.size();
+    eye_axes[at] = {{x, y, z}, eye};
+}
+
+extern "C" int bbgpu_stereo_frame_eye(void) {
+    return frame_eye.load(std::memory_order_acquire);
+}
+
+static int LookupEye(const float* axis) {
+    int best = 0;
+    float best_d = 2e-3f; // a fraction of the toe-in angle, well beyond rounding
+    for (const auto& e : eye_axes) {
+        if (!e.eye) {
+            continue;
+        }
+        const float d = std::fabs(e.axis[0] - axis[0]) + std::fabs(e.axis[1] - axis[1]) +
+                        std::fabs(e.axis[2] - axis[2]);
+        if (d < best_d) {
+            best_d = d;
+            best = e.eye;
+        }
+    }
+    return best;
+}
+
 void CameraMotion::OnVelocityConstants(const float* c, u32 dwords) {
     // Uncharted's camera velocity pass (its pixel shader, read from the shader dump):
     //   z = c9 / (depth - c8), view = (z (c0 u + c2), z (c1 v + c3), z)
@@ -271,6 +317,18 @@ void CameraMotion::OnVelocityConstants(const float* c, u32 dwords) {
     if (dwords < 60) {
         return;
     }
+#ifdef _WIN32
+    // bbport stereo diagnosis: BB_FIND_CAMERA=<n>: at the n-th velocity pass, where the game
+    // keeps this camera (probe.c runtime_find_camera_writers).
+    static const int find_camera_frame = [] {
+        const char* env = std::getenv("BB_FIND_CAMERA");
+        return env ? std::atoi(env) : 0;
+    }();
+    static int velocity_frames = 0;
+    if (find_camera_frame > 0 && ++velocity_frames == find_camera_frame && dwords >= 64) {
+        runtime_find_camera_writers(c);
+    }
+#endif
     auto& camera = velocity_camera;
     const float* rows[3] = {c + 40, c + 44, c + 52};
     for (int r = 0; r < 3; ++r) {
@@ -284,6 +342,16 @@ void CameraMotion::OnVelocityConstants(const float* c, u32 dwords) {
     }
     camera.uv_to_view = {c[0], c[1], c[2], c[3]};
     camera.depth_to_z = {c[8], c[9]};
+    // Stereo on alternate frames: which eye this frame's camera is (the camera hook's record).
+    if (eye_axes_head.load(std::memory_order_relaxed)) {
+        const float right[3] = {c[12], c[16], c[20]};
+        const int eye = LookupEye(right);
+        frame_eye.store(eye, std::memory_order_release);
+        if (!eye && eye_misses.fetch_add(1, std::memory_order_relaxed) < 20) {
+            std::printf("Stereo 3D: the velocity pass camera (right %g %g %g, pos %g %g %g) matches no eye\n",
+                        right[0], right[1], right[2], c[15], c[19], c[23]);
+        }
+    }
     camera.valid = c[9] != 0.0f &&
                    std::all_of(camera.to_previous_clip.begin(), camera.to_previous_clip.end(),
                                [](float v) { return std::isfinite(v); });

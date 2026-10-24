@@ -38,6 +38,26 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         }
     } else if (key == "frame_gen_multiplier") {
         v.frame_gen_multiplier = std::clamp(i, 2, 4);
+    } else if (key == "stereo") {
+        for (int s = 0; s < StereoCount; ++s) {
+            if (value == StereoName(s)) {
+                v.stereo = s;
+            }
+        }
+    } else if (key == "stereo_depth") {
+        v.stereo_depth = Clamp(f, 0.0f, 10.0f);
+    } else if (key == "stereo_convergence") {
+        v.stereo_convergence = Clamp(f, 0.01f, 1000.0f);
+    } else if (key == "stereo_popout") {
+        v.stereo_popout = Clamp(f, 0.0f, 10.0f);
+    } else if (key == "stereo_swap") {
+        v.stereo_swap = i != 0;
+    } else if (key == "stereo_output") {
+        for (int o = 0; o < StereoOutputCount; ++o) {
+            if (value == StereoOutputName(o)) {
+                v.stereo_output = o;
+            }
+        }
     } else if (key == "preset") {
         v.preset = std::clamp(i, 0, PresetCount - 1);
     } else if (key == "sharpen") {
@@ -122,6 +142,9 @@ void Load() {
         {"BB_REACTIVE_THRESHOLD", "reactive_threshold"}, {"BB_REACTIVE_MAX", "reactive_max"},
         {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
         {"BB_FRAME_GEN", "frame_gen"},              {"BB_FRAME_GEN_MULTIPLIER", "frame_gen_multiplier"},
+        {"BB_STEREO", "stereo"},                    {"BB_STEREO_DEPTH", "stereo_depth"},
+        {"BB_STEREO_CONVERGENCE", "stereo_convergence"}, {"BB_STEREO_POPOUT", "stereo_popout"},
+        {"BB_STEREO_SWAP", "stereo_swap"},           {"BB_STEREO_OUTPUT", "stereo_output"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env)) {
@@ -225,6 +248,12 @@ void Save() {
                  OutputWidths[v.output_res], OutputHeights[v.output_res]);
     std::fprintf(file, "frame_gen=%s\nframe_gen_multiplier=%d\n", FrameGenName(v.frame_gen),
                  v.frame_gen_multiplier.load());
+    std::fprintf(file,
+                 "stereo=%s\nstereo_depth=%.2f\nstereo_convergence=%.3f\nstereo_popout=%.2f\n"
+                 "stereo_swap=%d\nstereo_output=%s\n",
+                 StereoName(v.stereo), v.stereo_depth.load(), v.stereo_convergence.load(),
+                 v.stereo_popout.load(), int(v.stereo_swap.load()),
+                 StereoOutputName(v.stereo_output));
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");
@@ -260,4 +289,27 @@ bool FsrDriverValidated(unsigned driver_id) {
     return false;
 }
 
+const char* StereoName(int stereo) {
+    static constexpr const char* names[StereoCount] = {"off", "sbs", "alt"};
+    return names[std::clamp(stereo, 0, StereoCount - 1)];
+}
+
+const char* StereoOutputName(int output) {
+    static constexpr const char* names[StereoOutputCount] = {"sbs", "sr"};
+    return names[std::clamp(output, 0, StereoOutputCount - 1)];
+}
+
 } // namespace BbSettings
+
+// The camera hook (runtime_pad.c): stereo on alternate frames is on, with the eye's half
+// separation (game units: the "depth" setting as 3.2 cm) and the convergence distance.
+extern "C" int bbport_stereo_alt(float* half_separation, float* convergence, int* swap) {
+    const auto& v = BbSettings::Get();
+    if (v.stereo != BbSettings::StereoAlt) {
+        return 0;
+    }
+    *half_separation = v.stereo_depth.load() * 0.032f;
+    *convergence = v.stereo_convergence.load();
+    *swap = v.stereo_swap ? 1 : 0;
+    return 1;
+}

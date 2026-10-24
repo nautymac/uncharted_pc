@@ -148,6 +148,48 @@ void Slider(const char* label, std::atomic<float>& value, float lo, float hi) {
     Store(value, v, ImGui::SliderFloat(label, &v, lo, hi, "%.2f"));
 }
 
+// Stereo 3D keys, menu open or not (Ctrl+F3, Ctrl+F5..F9): true when `key` is one.
+bool StereoKey(SDL_Keycode key) {
+    auto& s = BbSettings::Get();
+    switch (key) {
+    case SDLK_F3: // off -> sbs -> alt -> off
+        s.stereo = (s.stereo + 1) % BbSettings::StereoCount;
+        break;
+    case SDLK_F5:
+        s.stereo_depth = std::max(0.0f, s.stereo_depth - 0.1f);
+        break;
+    case SDLK_F6:
+        s.stereo_depth = std::min(10.0f, s.stereo_depth + 0.1f);
+        break;
+    case SDLK_F7:
+        s.stereo_convergence = std::max(0.01f, s.stereo_convergence / 1.1f);
+        break;
+    case SDLK_F8:
+        s.stereo_convergence = std::min(1000.0f, s.stereo_convergence * 1.1f);
+        break;
+    case SDLK_F9:
+        s.stereo_swap = !s.stereo_swap;
+        break;
+    case SDLK_F10:
+        // The next frame's dump (BB_FRAME_DUMP_TRIGGER, written to BB_DUMP_DIR).
+        if (const char* trigger = std::getenv("BB_FRAME_DUMP_TRIGGER")) {
+            if (FILE* file = std::fopen(trigger, "w")) {
+                std::fclose(file);
+                std::printf("Stereo 3D: frame dump requested\n");
+            }
+        }
+        return true;
+    default:
+        return false;
+    }
+    std::printf("Stereo 3D: %s, depth %.2f%%, convergence %.3f, pop-out %.2f%%%s\n",
+                BbSettings::StereoName(s.stereo), s.stereo_depth.load(),
+                s.stereo_convergence.load(), s.stereo_popout.load(),
+                s.stereo_swap ? ", eyes swapped" : "");
+    BbSettings::Save();
+    return true;
+}
+
 void Hint(const char* text) {
     ImGui::SameLine();
     ImGui::TextDisabled("(?)");
@@ -343,6 +385,49 @@ void Menu() {
     if (const char* problem = s.frame_gen_problem.load()) {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "%s", problem);
     }
+
+    ImGui::SeparatorText("3D (stereo)");
+    static const char* stereo_modes[] = {"Off", "Side by side from depth (SBS)",
+                                         "Alternate frames (camera hook)"};
+    const int stereo = s.stereo;
+    if (ImGui::BeginCombo("3D output", stereo_modes[stereo])) {
+        for (int i = 0; i < BbSettings::StereoCount; ++i) {
+            if (ImGui::Selectable(stereo_modes[i], i == stereo)) {
+                Store(s.stereo, i, true);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    Hint("Both eyes side by side, made from the game's own depth, for 3D displays and weavers "
+         "(SRCapture3D --mode sbs). The UI stays at screen depth. Frame generation is off "
+         "while it is on. Keys: Ctrl+F3 on/off, Ctrl+F5/F6 depth, Ctrl+F7/F8 convergence, "
+         "Ctrl+F9 swap eyes.");
+    ImGui::BeginDisabled(s.stereo == BbSettings::StereoOff);
+    Slider("Depth (% of width)", s.stereo_depth, 0.0f, 5.0f);
+    float convergence = s.stereo_convergence;
+    Store(s.stereo_convergence, convergence,
+          ImGui::SliderFloat("Convergence", &convergence, 0.1f, 100.0f, "%.2f",
+                             ImGuiSliderFlags_Logarithmic));
+    Hint("The view distance shown at screen depth: nearer comes out of the screen.");
+    Slider("Pop-out limit (%)", s.stereo_popout, 0.0f, 5.0f);
+    Checkbox("Swap eyes", s.stereo_swap);
+    static const char* stereo_outputs[] = {"Side by side in the window", "SR panel (woven in the window)"};
+    const int stereo_output = s.stereo_output;
+    if (ImGui::BeginCombo("3D output", stereo_outputs[stereo_output])) {
+        for (int i = 0; i < BbSettings::StereoOutputCount; ++i) {
+            if (ImGui::Selectable(stereo_outputs[i], i == stereo_output)) {
+                Store(s.stereo_output, i, true);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    Hint("SR panel: the picture is woven for the panel by the SR SDK (ps2sr.dll beside the "
+         "executable, the SR runtime installed). Side by side: for a weaver that reads the window "
+         "(SRCapture3D --mode sbs) or a 3D display.");
+    if (const char* problem = s.stereo_sr_problem.load()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "SR: %s", problem);
+    }
+    ImGui::EndDisabled();
 
     ImGui::SeparatorText("Output resolution");
     static const char* outputs[] = {"1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160"};
@@ -741,6 +826,9 @@ bool HandleEvent(const SDL_Event& event) {
             SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
             return true;
         }
+        if (down && (event.key.mod & SDL_KMOD_CTRL) && StereoKey(event.key.key)) {
+            return true;
+        }
         if (!is_open) {
             return false;
         }
@@ -869,7 +957,8 @@ void NotePresent() {
     }
 }
 
-void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
+void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
+            bool side_by_side) {
     const float ms = last_present_ms;
     if (!Visible()) {
         return;
@@ -916,7 +1005,45 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     {
         // Font atlas uploads submit to the graphics queue themselves.
         std::scoped_lock submit_lock{Vulkan::Scheduler::submit_mutex};
-        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmdbuf);
+        ImDrawData* draw_data = ImGui::GetDrawData();
+        if (!side_by_side) {
+            ImGui_ImplVulkan_RenderDrawData(draw_data, cmdbuf);
+        } else {
+            // The menu laid out for the whole display, squeezed into each half: a copy of
+            // every draw list moved one display width right, and the whole drawn as twice as
+            // wide at half scale (the backend's viewport is DisplaySize * FramebufferScale).
+            // One call: the backend's vertex buffers rotate once per call.
+            const float width = draw_data->DisplaySize.x;
+            const int lists = draw_data->CmdListsCount;
+            const int vertices = draw_data->TotalVtxCount, indices = draw_data->TotalIdxCount;
+            ImVector<ImDrawList*> copies;
+            for (int i = 0; i < lists; ++i) {
+                ImDrawList* copy = draw_data->CmdLists[i]->CloneOutput();
+                for (ImDrawVert& vertex : copy->VtxBuffer) {
+                    vertex.pos.x += width;
+                }
+                for (ImDrawCmd& command : copy->CmdBuffer) {
+                    command.ClipRect.x += width;
+                    command.ClipRect.z += width;
+                }
+                copies.push_back(copy);
+            }
+            for (ImDrawList* copy : copies) {
+                draw_data->AddDrawList(copy);
+            }
+            draw_data->DisplaySize.x = 2.0f * width;
+            draw_data->FramebufferScale = ImVec2(0.5f, 1.0f);
+            ImGui_ImplVulkan_RenderDrawData(draw_data, cmdbuf);
+            draw_data->DisplaySize.x = width;
+            draw_data->FramebufferScale = ImVec2(1.0f, 1.0f);
+            draw_data->CmdLists.resize(lists);
+            draw_data->CmdListsCount = lists;
+            draw_data->TotalVtxCount = vertices;
+            draw_data->TotalIdxCount = indices;
+            for (ImDrawList* copy : copies) {
+                IM_DELETE(copy);
+            }
+        }
     }
     cmdbuf.endRendering();
 }

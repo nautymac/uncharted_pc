@@ -63,6 +63,10 @@ public:
     [[nodiscard]] bool IsVelocityShader(u64 ps_hash) const noexcept;
     /// The velocity pass's constant buffer (`dwords` of it).
     void OnVelocityConstants(const float* data, u32 dwords);
+    /// The velocity pass's view depth from hardware depth: z = [1] / (depth - [0]).
+    [[nodiscard]] std::array<float, 2> DepthToZ() const noexcept {
+        return velocity_camera.depth_to_z;
+    }
     /// Records the motion vector pass from the velocity pass's camera into `motion_view`
     /// (RG16F storage, General), pixels, previous minus current; zero without that camera.
     void RecordVelocity(vk::CommandBuffer cmdbuf, vk::ImageView depth_view,

@@ -159,6 +159,11 @@ public:
     }
 
     /// Returns true when VK_EXT_shader_stencil_export is supported
+    /// bbport: memory and semaphores shared with D3D11 (VK_KHR_external_*_win32).
+    bool IsExternalWin32Supported() const {
+        return external_win32;
+    }
+
     bool IsShaderStencilExportSupported() const {
         return shader_stencil_export;
     }
@@ -576,6 +581,7 @@ private:
     bool list_restart{};
     bool provoking_vertex{};
     bool shader_stencil_export{};
+    bool external_win32{}; // bbport: VK_KHR_external_memory_win32 and VK_KHR_external_semaphore_win32
     bool image_load_store_lod{};
     bool amd_gcn_shader{};
     bool amd_shader_trinary_minmax{};

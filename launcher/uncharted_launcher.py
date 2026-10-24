@@ -96,6 +96,10 @@ FSR411 = ('fsr411', 'AMD FSR 4.1.1 (Native AA)')
 XESS = ('xess', 'Intel XeSS (Native AA, any GPU)')
 AA_SHARPNESS = [('0', 'Off'), ('0.2', 'Low'), ('0.4', 'Medium'), ('0.7', 'High')]
 # Frames generated between two of the game's (BB_FRAME_GEN, BB_FRAME_GEN_MULTIPLIER).
+# Stereo 3D (gpu/shim/bbport_settings.h): how the eyes are made, and where the picture goes.
+STEREO_MODES = [('off', 'Off'), ('alt', 'Alternate frames (the game draws each eye)'),
+                ('sbs', 'From the depth buffer (one picture, reprojected)')]
+STEREO_OUTPUTS = [('sr', 'SR panel (woven in the window)'), ('sbs', 'Side by side in the window')]
 FRAME_GENERATION = [('off', 'Off'), ('fsr3', 'AMD FSR 3 Frame Generation (any GPU)'),
                     ('dlss', 'NVIDIA DLSS Frame Generation (GeForce RTX 40/50)')]
 BUTTON_PROMPTS = [('auto', 'Automatic (follows the device you used last)'),
@@ -200,6 +204,8 @@ APP_DEFAULTS = {'game_dir': '', 'game_dir_u1': '', 'game_dir_u2': '', 'game_dir_
                 'window_size': '1920x1080', 'render_height': '1080', 'aspect': '16:9', 'speakers': 'auto', 'scaler': 'fsr1', 'sharpening': '500',
                 'anti_aliasing': 'off', 'aa_sharpness': '0.2', 'frame_generation': 'off',
                 'frame_gen_multiplier': '2', 'extra_env': '', 'close_on_play': False,
+                'stereo': 'off', 'stereo_output': 'sr', 'stereo_depth': '1.0', 'stereo_convergence': '3.0',
+                'stereo_swap': False,
                 'mouse_look': True, 'mouse_sensitivity': '1.0', 'mouse_invert_y': False,
                 'pad_invert_y': False, 'art_banner': '', 'art_u1': '', 'art_u2': '', 'art_u3': '', 'steam_art': '', 'art_crops': {}, 'shortcut_name': 'Uncharted: The Nathan Drake Collection', 'shortcut_icon': '', 'trophy_game': 'u1', 'pad_vibration': True, 'pad_vibration_strength': '100', 'button_prompts': 'auto', 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True,
                 **{key: 'auto' for key in FIXES},
@@ -530,6 +536,12 @@ def game_environment(s, start=None):
     env['BB_FSR_SHARPNESS'] = str(s.get('aa_sharpness') or '0')
     env['BB_FRAME_GEN'] = str(s.get('frame_generation') or 'off')
     env['BB_FRAME_GEN_MULTIPLIER'] = str(s.get('frame_gen_multiplier') or '2')
+    # Stereo 3D (the 3D page); the in-game menu and keys change the same settings for the session.
+    env['BB_STEREO'] = str(s.get('stereo') or 'off')
+    env['BB_STEREO_OUTPUT'] = str(s.get('stereo_output') or 'sr')
+    env['BB_STEREO_DEPTH'] = str(s.get('stereo_depth') or '1.0')
+    env['BB_STEREO_CONVERGENCE'] = str(s.get('stereo_convergence') or '3.0')
+    env['BB_STEREO_SWAP'] = '1' if s.get('stereo_swap') else '0'
     for key, (_title, _hint, choices) in FIXES.items():
         env.update(choices.get(str(s.get(key) or 'auto'), {}))
     env['BB_BUTTON_PROMPTS'] = str(s.get('button_prompts') or 'auto')
@@ -555,7 +567,7 @@ COLORS = {'surface': SURFACE, 'card': CARD, 'card_hi': CARD_HI, 'line': LINE, 't
           'gold': GOLD, 'gold_hi': GOLD_HI, 'track': '#2c2e33', 'knob': '#9a958b', 'knob_on': '#f7f1e2',
           'button': '#25272b', 'button_hi': '#30333a'}
 # Sidebar icons (Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets on Windows 10).
-NAV_ICONS = {'play': '\ue768', 'game': '\ue7fc', 'display': '\ue7f4', 'controls': '\ue765',
+NAV_ICONS = {'play': '\ue768', 'game': '\ue7fc', 'display': '\ue7f4', '3d': '\ue809', 'controls': '\ue765',
              'cheats': '\ue945', 'fixes': '\ue90f', 'trophies': '\ue734', 'advanced': '\ue713', 'log': '\ue8a5'}
 # Trophy grades as the console colours them (the platinum cool white-blue, the rest metal).
 TROPHY_COLORS = {'P': '#9fd0f5', 'G': GOLD, 'S': '#cfd3da', 'B': '#cf8548'}
@@ -1013,6 +1025,7 @@ class Launcher:
         tk.Frame(side, bg=LINE, height=1).pack(fill='x', padx=18, pady=(16, 14))
         self.nav, self.nav_pills, self.nav_icons, self.nav_marks, self.current_page = {}, {}, {}, {}, None
         for name, title in (('play', _('Play')), ('game', _('Game')), ('cheats', _('Cheats')), ('display', _('Display')),
+                            ('3d', _('3D')),
                             ('controls', _('Controls')), ('fixes', _('Fixes')), ('trophies', _('Trophies')), ('advanced', _('Advanced')),
                             ('log', _('Log'))):
             row = tk.Frame(side, bg=BG, cursor='hand2')
@@ -1071,6 +1084,7 @@ class Launcher:
         self.build_play()
         self.build_game()
         self.build_display()
+        self.build_3d()
         self.build_controls()
         self.build_fixes()
         self.build_trophies()
@@ -1403,6 +1417,36 @@ class Launcher:
                  _('What the games are told the speakers are, which sets the choices in their Audio Output '
                    'menu (stereo, 5.1, 7.1). Automatic follows the Windows speaker configuration of the '
                    'default playback device; set it to 5.1 or 7.1 when the games only offer stereo.'))
+
+    def build_3d(self):
+        f = self.page('3d', _('3D'), _('Stereoscopic 3D for an SR panel or a side-by-side 3D display.'))
+        self.row(f, _('3D'), self.choice(f, 'stereo', STEREO_MODES, 40),
+                 _('Alternate frames: the game draws the left and the right eye on alternate frames, with its '
+                   'camera moved (the 120 FPS frame rate gives 60 per eye; set Mailbox presentation). From the '
+                   'depth buffer: one picture reprojected into two eyes, cheaper but with soft edges where one '
+                   'eye sees behind things. Frame generation is off while 3D is on.'))
+        sr = (PORT_DIR / 'bin' / 'ps2sr.dll').is_file() or (PORT_DIR / 'out' / 'ps2sr.dll').is_file()
+        self.row(f, _('Output'), self.choice(f, 'stereo_output', STEREO_OUTPUTS, 40),
+                 _('SR panel: woven for the panel by the SR SDK, through ps2sr.dll beside the game executable '
+                   'and the SR runtime (Acer SpatialLabs, Leia SR); without them the picture stays side by side. '
+                   'Side by side: for a weaver that reads the window, or a 3D display.') +
+                 ('' if sr else ' ' + _('ps2sr.dll was not found next to the game executable.')))
+        from uncharted_widgets import Slider
+        self.section(f, _('Depth'))
+        self.row(f, _('Eye separation'),
+                 Slider(self.tk, self.target(f), self.var('stereo_depth'), 0.0, 5.0, 0.05, COLORS, self.px,
+                        self.font_ui_md, width=300, entry=True),
+                 _('1.0 is about the distance between two eyes (3.2 cm per eye in the game\'s world). '
+                   'Larger: deeper, but harder to fuse. In the game: Ctrl+F5 / Ctrl+F6.'))
+        self.row(f, _('Convergence'),
+                 Slider(self.tk, self.target(f), self.var('stereo_convergence'), 0.1, 100.0, 0.1, COLORS, self.px,
+                        self.font_ui_md, width=300, log=True, entry=True, suffix=' m'),
+                 _('The distance (metres) shown at the screen\'s depth: nearer things come out of the screen, '
+                   'farther ones go in. In the game: Ctrl+F7 / Ctrl+F8.'))
+        self.check(f, 'stereo_swap', _('Swap the eyes'),
+                   _('When the picture looks inside out. In the game: Ctrl+F9.'))
+        self.note(f, _('In the game, Ctrl+F3 switches 3D off and on, Insert opens the settings menu with the same '
+                       'values. These settings are applied when the game starts.'))
 
     def build_controls(self):
         f = self.page('controls', _('Controls'),

@@ -331,6 +331,12 @@ bool Instance::CreateDevice() {
     }
     provoking_vertex = add_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     shader_stencil_export = add_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+#ifdef _WIN32
+    // bbport: stereo 3D woven for an SR panel by D3D11 (vk_sr_output.cpp): textures and a fence
+    // shared with D3D11.
+    external_win32 = add_extension("VK_KHR_external_memory_win32") &&
+                     add_extension("VK_KHR_external_semaphore_win32");
+#endif
     image_load_store_lod = add_extension(VK_AMD_SHADER_IMAGE_LOAD_STORE_LOD_EXTENSION_NAME);
     amd_gcn_shader = add_extension(VK_AMD_GCN_SHADER_EXTENSION_NAME);
     amd_shader_trinary_minmax = add_extension(VK_AMD_SHADER_TRINARY_MINMAX_EXTENSION_NAME);

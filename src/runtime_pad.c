@@ -18,6 +18,7 @@
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/bbgpu.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -624,7 +625,148 @@ _Static_assert(sizeof(u3_focus_reset_100)==51 && sizeof(u3_focus_reset_102)==53,
 /* The camera code, the pad code and the assertion are found by their instructions, so a build of the
  * game that has them works (version 1.00 and 1.02 are known; "build" below). RIP-relative
  * displacements and call targets are wildcards. Entries with one name are variants for the builds. */
+/* U1/U2/U3 (both versions): Naughty Dog's constant-update-engine code keeps a table of the resources a shader uses
+ * (header, then 0x30-byte entries) and fills it in a leaf function that holds its running entry indices in the
+ * 128 bytes below rsp (the compiler's red zone). A table placed across a page boundary takes a GPU-tracking write
+ * fault inside that function when the next page is write-protected, and the red zone comes out of the exception
+ * zeroed: one entry then gets the wrong index, its word is garbage, and the draw that walks the table calls a
+ * null member pointer (issue cluster C5). The pages the table covers are written once before the function starts,
+ * so the fault, if there is one, happens while no red-zone data is live. */
+static void __attribute__((ms_abi)) cue_table_pretouch(uint64_t table, uint64_t slots, uint64_t image, uint64_t r14, const RuntimeGuestRegs *regs) {
+    (void)slots; (void)image; (void)r14;
+    const uint32_t count=(uint32_t)regs->rdx;
+    if (!count || count>64) return;
+    const uint64_t end=table+0x28+0x30ull*count;
+    for (uint64_t page=table&~0xfffull;page<end;page+=0x1000) {
+        const uint8_t *at=(const uint8_t *)(uintptr_t)(page<table ? table : page);
+        __asm__ volatile("lock orb $0, (%0)" : : "r"(at) : "memory","cc");
+    }
+}
+/* ---- stereo 3D on alternate frames (BbSettings::StereoAlt, bbport_stereo_alt) ---------------
+ * One function of the game makes a render camera's matrices (rendercamera.h; U1 1.02 0x2c9660,
+ * found by its pattern below) from the camera's axes at +0x250 (right), +0x260 (up), +0x270
+ * (forward) and its position at +0x280; +0x2a4 is set for an orthographic camera, +0x2a6 when
+ * its matrices are kept. A callback at its start moves a perspective camera sideways by the
+ * eye's half separation and turns it onto the convergence point (toe-in: every matrix the game
+ * derives from the camera stays consistent), the other eye on the next call for the same camera
+ * object, and records the eye's right axis for the presenter (bbgpu_stereo_eye_axis, matched
+ * against the velocity pass's camera). A camera whose axes and position still hold the values
+ * written last time is restored first, so a camera the game does not rewrite every frame does
+ * not drift. BB_STEREO_LOG=1 prints the first calls: which cameras pass here, from where.
+ * BB_STEREO_CALLERS=<hex offsets> limits the eyes to cameras updated from those call sites. */
+void bbgpu_stereo_eye_axis(int eye, float x, float y, float z); /* vk_camera_motion.cpp */
+int bbport_stereo_alt(float *half_separation, float *convergence, int *swap); /* bbport_settings.cpp */
+typedef struct { uint64_t object; float written[16]; float original[16]; int eye; uint64_t us; } StereoCamera;
+static StereoCamera stereo_cameras[8];
+static void stereo_normalize(float *v) {
+    const float n=sqrtf(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
+    if (n>0.0f) { v[0]/=n; v[1]/=n; v[2]/=n; }
+}
+/* `camera`: a render camera object; `apply`: the eyes are applied here (the per-frame
+ * SetRenderCamera), else the call is only logged. */
+static void stereo_render_camera(uint64_t camera, uint64_t caller, const char *site, int apply) {
+    float *axes=(float *)(uintptr_t)(camera+0x250); /* right, up, forward, position: 4 rows of 4 */
+    const uint8_t ortho=*(const uint8_t *)(uintptr_t)(camera+0x2a4), kept=*(const uint8_t *)(uintptr_t)(camera+0x2a6);
+    static int logging=-1, logged;
+    if (logging<0) logging=getenv("BB_STEREO_LOG")!=NULL;
+    if (logging && logged<600) {
+        ++logged;
+        printf("Render camera: %s t=%.4f obj %#llx from %#llx ortho %d kept %d fov %g zoom %g near %g far %g pos %g %g %g right %g %g %g fwd %g %g %g\n",
+               site,now_us()*1e-6,(unsigned long long)camera,(unsigned long long)caller,ortho,kept,
+               *(float *)(uintptr_t)(camera+0x290),*(float *)(uintptr_t)(camera+0x294),*(float *)(uintptr_t)(camera+0x298),*(float *)(uintptr_t)(camera+0x29c),
+               axes[12],axes[13],axes[14],axes[0],axes[1],axes[2],axes[8],axes[9],axes[10]);
+    }
+    if (!apply || ortho) return;
+    float half, convergence; int swap;
+    if (!bbport_stereo_alt(&half,&convergence,&swap)) return;
+    static const char *callers=NULL; static int callers_read;
+    if (!callers_read) { callers_read=1; callers=getenv("BB_STEREO_CALLERS"); if (callers && !*callers) callers=NULL; }
+    if (callers) {
+        int found=0;
+        for (const char *p=callers;*p && !found;) { char *end; const uint64_t v=strtoull(p,&end,16); if (end==p) break; found=v==caller; p=*end==',' ? end+1 : end; }
+        if (!found) return;
+    }
+    /* This camera's record: the eye alternates per object; stale records (0.5 s) are reused. */
+    const uint64_t now=now_us();
+    StereoCamera *c=NULL, *oldest=&stereo_cameras[0];
+    for (size_t i=0;i<sizeof(stereo_cameras)/sizeof(*stereo_cameras);++i) {
+        if (stereo_cameras[i].object==camera) { c=&stereo_cameras[i]; break; }
+        if (stereo_cameras[i].us<oldest->us) oldest=&stereo_cameras[i];
+    }
+    if (!c) { c=oldest; memset(c,0,sizeof(*c)); c->object=camera; }
+    if (c->us && now-c->us<500000 && !memcmp(axes,c->written,sizeof(c->written))) memcpy(axes,c->original,sizeof(c->original)); /* still our last eye: back to the game's camera */
+    memcpy(c->original,axes,sizeof(c->original));
+    c->eye=c->eye==1 ? 2 : 1;
+    c->us=now;
+    const float e=(c->eye==2) != (swap!=0) ? 1.0f : -1.0f; /* right eye: +right */
+    float *right=axes, *up=axes+4, *fwd=axes+8, *pos=axes+12;
+    float f[3]={fwd[0],fwd[1],fwd[2]}, r[3]={right[0],right[1],right[2]};
+    stereo_normalize(f); stereo_normalize(r);
+    /* The eye moves along the right axis; its forward axis points at the convergence point of
+     * the centre camera, its right axis stays perpendicular (same handedness as before). */
+    for (int k=0;k<3;++k) pos[k]+=e*half*r[k];
+    float nf[3]={convergence*f[0]-e*half*r[0],convergence*f[1]-e*half*r[1],convergence*f[2]-e*half*r[2]};
+    stereo_normalize(nf);
+    float nr[3]={up[1]*nf[2]-up[2]*nf[1],up[2]*nf[0]-up[0]*nf[2],up[0]*nf[1]-up[1]*nf[0]};
+    stereo_normalize(nr);
+    if (nr[0]*r[0]+nr[1]*r[1]+nr[2]*r[2]<0.0f) { nr[0]=-nr[0]; nr[1]=-nr[1]; nr[2]=-nr[2]; }
+    const float rn=sqrtf(right[0]*right[0]+right[1]*right[1]+right[2]*right[2]), fn=sqrtf(fwd[0]*fwd[0]+fwd[1]*fwd[1]+fwd[2]*fwd[2]);
+    for (int k=0;k<3;++k) { right[k]=nr[k]*rn; fwd[k]=nf[k]*fn; }
+    memcpy(c->written,axes,sizeof(c->written));
+    bbgpu_stereo_eye_axis(c->eye,nr[0],nr[1],nr[2]);
+}
+/* The return address of the hooked call: the thunk saved the registers below the guest's stack
+ * (lea rsp,[rsp-0x80]; 12 pushes), and at a function's start (no push yet) the return address
+ * sits right above them. */
+static uint64_t guest_caller(const RuntimeGuestRegs *regs, uint64_t image) {
+    return *(const uint64_t *)((const char *)regs+sizeof(*regs)+0x80)-image;
+}
+/* The game's SetRenderCamera (U1 1.02 0x2cdb70): copies the camera it is given into the global
+ * render camera (rax at the hook, after `lea rax, [rip+g_renderCamera]`). It runs only when the
+ * game sets a new camera (a few times a second), so the eyes are not applied here: its address
+ * is kept for the frame hook. */
+static uint64_t stereo_render_camera_global;
+static void __attribute__((ms_abi)) u1_set_render_camera(uint64_t camera, uint64_t unused, uint64_t image, uint64_t r14, const RuntimeGuestRegs *regs) {
+    (void)unused; (void)r14;
+    if (!stereo_render_camera_global && regs->rax>image) {
+        stereo_render_camera_global=regs->rax;
+        printf("Stereo 3D: the render camera is at image+%#llx\n",(unsigned long long)(regs->rax-image));
+    }
+    stereo_render_camera(camera,guest_caller(regs,image),"set",0);
+}
+/* The game's frame setup (U1 1.02 0xf13b0, once a frame on the game thread): snapshots the
+ * global render camera into the frame's and derives the frame's matrices from the snapshot's
+ * axes. The eyes are applied to the global camera right before. */
+static void __attribute__((ms_abi)) u1_frame_camera(uint64_t frame, uint64_t unused, uint64_t image, uint64_t r14, const RuntimeGuestRegs *regs) {
+    (void)frame; (void)unused; (void)r14;
+    if (!stereo_render_camera_global) return;
+    stereo_render_camera(stereo_render_camera_global,guest_caller(regs,image),"frame",1);
+}
+/* The render camera matrix builder (rendercamera.h): logged only (BB_STEREO_LOG). */
+static void __attribute__((ms_abi)) u1_render_camera(uint64_t camera, uint64_t unused, uint64_t image, uint64_t r14, const RuntimeGuestRegs *regs) {
+    (void)unused; (void)r14;
+    stereo_render_camera(camera,guest_caller(regs,image),"matrices",0);
+}
 static const RuntimeGuestCallback guest_callbacks[]={
+    /* U1 frame setup, build 102: push rbp; mov rbp,rsp; push r15; push r14; push r13; push r12;
+     * push rbx; sub rsp,0x40a8; mov r15,rdi; mov r12,[rip+..]; mov rax,[r12]; mov [rbp-0x30],rax;
+     * lea rbx,[rip+..]; cmp qword [rbx],.. */
+    {"U1 frame camera (stereo)",
+      "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec a8 40 00 00 49 89 ff 4c 8b 25 ?? ?? ?? ?? "
+      "49 8b 04 24 48 89 45 d0 48 8d 1d ?? ?? ?? ?? 48 83 3b",
+      0x0, 6, u1_frame_camera, NULL},
+    /* U1 SetRenderCamera, build 102: vmovaps xmm0,[rdi]; lea rax,[rip+g_renderCamera];
+     * vmovaps [rax],xmm0; vmovaps xmm0,[rdi+0x10]; ... The hook sits after the lea (RIP-relative,
+     * it cannot move) and moves the two 4+5-byte copies that follow. */
+    {"U1 set render camera (stereo)",
+      "c5 f8 28 07 48 8d 05 ?? ?? ?? ?? c5 f8 29 00 c5 f8 28 47 10 c5 f8 29 40 10 c5 f8 28 47 20 "
+      "c5 f8 29 40 20 c5 f8 28 47 30 c5 f8 29 40 30",
+      0xb, 9, u1_set_render_camera, NULL},
+    /* U1 render camera matrices (rendercamera.h), build 102: push rbp; mov rbp,rsp; push rbx;
+     * sub rsp,0xc8; mov rbx,rdi; cmp byte [rbx+0x2a6],0 */
+    {"U1 render camera matrices (stereo log)",
+      "55 48 89 e5 53 48 81 ec c8 00 00 00 48 89 fb 80 bb a6 02 00 00 00 0f 85 ?? ?? ?? ?? e8 ?? ?? ?? ?? c5 f0 57 c9",
+      0x0, 12, u1_render_camera, NULL},
     /* U1 follow camera, build 100 */
     {"U1 follow camera (mouse)",
       "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 28 01 00 00 "
@@ -790,6 +932,11 @@ static const RuntimeGuestCallback guest_callbacks[]={
       "41 b8 4d 04 00 00 45 31 c9 ff d0 cd 41 c5 f8 28 45 d0",
       0x0, 58, NULL, u2_focus_reset_102},
 
+    /* The 7 bytes after the mov r9 are `mov qword [rdi], 0`: link_modules.py (patches/redzone.json, PR #403) replaces that
+     * store with a jump to a red-zone-safe copy on Windows, so they are masked and the hook is found either way. */
+    {"CUE table fill",
+      "55 41 57 41 56 41 55 41 54 53 49 b9 00 24 00 0d 10 00 00 00 ?? ?? ?? ?? ?? ?? ?? 45 31 f6",
+      0, 5, cue_table_pretouch, NULL},
 };
 const RuntimeGuestCallback *runtime_guest_callbacks(size_t *count) {
     *count=sizeof(guest_callbacks)/sizeof(*guest_callbacks);

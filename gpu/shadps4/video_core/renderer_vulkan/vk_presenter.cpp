@@ -13,6 +13,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "bbport_overlay.h"
+#include "bbport_settings.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -162,6 +163,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 
     frame_generator = std::make_unique<FrameGenerator>(instance, draw_scheduler);
     rasterizer->GetUpscaler().SetFrameGenerator(frame_generator.get());
+    stereo = std::make_unique<Stereo>(instance, draw_scheduler);
+    sr_output = CreateSrOutput(instance, present_scheduler);
 }
 
 Presenter::~Presenter() {
@@ -380,6 +383,8 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
     return {};
 }
 
+extern "C" int bbgpu_stereo_frame_eye(void); // vk_camera_motion.cpp
+
 // bbport: raw copy of an image for BB_FRAME_DUMP_TRIGGER, written once the GPU is done.
 static void DumpRaw(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
                     vk::Image image, vk::ImageLayout layout, u32 w, u32 h, const char* name,
@@ -519,6 +524,81 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
 
+    // bbport: the picture before the UI, composed like the frame (equal outside the UI), for
+    // frame generation and stereo 3D; null when this frame has none.
+    vk::Image hudless{};
+    vk::ImageView hudless_view{};
+    const auto compose_hudless = [&] {
+        vk::Extent2D hudless_size{};
+        const auto source = frame_generator->Hudless(view_info.format, hudless_size);
+        if (!source || hudless_size != image_size) {
+            return;
+        }
+        if (hudless_frame.width != frame->width || hudless_frame.height != frame->height ||
+            !hudless_frame.image) {
+            RecreateFrame(&hudless_frame, frame->width, frame->height);
+        }
+        const vk::ImageMemoryBarrier2 to_target{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .image = hudless_frame.image,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_target});
+        const auto scaled = fsr_pass.Render(cmdbuf, source, hudless_size,
+                                            {frame->width, frame->height}, fsr_settings,
+                                            frame->is_hdr);
+        pp_pass.Render(cmdbuf, scaled, hudless_size, hudless_frame, pp_settings);
+        hudless = hudless_frame.image;
+        hudless_view = hudless_frame.image_view;
+    };
+
+    // bbport: stereo 3D: the two eyes side by side replace the frame (no frame generation).
+    const bool stereo_on = Stereo::Wanted();
+    if (stereo_on && ::BbSettings::Get().stereo == ::BbSettings::StereoAlt) {
+        // Alternate frames: this frame is one eye (the camera hook's record, read from the
+        // frame's velocity pass), or flat without one.
+        const auto scene = upscaled ? FrameGenerator::StereoScene{} : frame_generator->Scene();
+        const int eye = scene.depth ? bbgpu_stereo_frame_eye() : 0;
+        stereo->ComposeAlternate(cmdbuf, frame->image, frame->image_view, frame->width,
+                                 frame->height, eye);
+        if (!frame_generator->Wanted()) {
+            frame_generator->FinishFrame();
+        }
+    } else if (stereo_on) {
+        if (!upscaled) {
+            compose_hudless();
+        }
+        const auto scene = upscaled ? FrameGenerator::StereoScene{} : frame_generator->Scene();
+        if (frame_dump) {
+            // The frame and the picture without UI before the eyes are made, and the camera
+            // (the depth is fg_depth, written at its capture).
+            const vk::MemoryBarrier2 done{.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                                          .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                                          .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                          .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
+            cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &done});
+            DumpRaw(instance, draw_scheduler, cmdbuf, frame->image, vk::ImageLayout::eGeneral,
+                    frame->width, frame->height, "center", frame_dump_index);
+            if (hudless) {
+                DumpRaw(instance, draw_scheduler, cmdbuf, hudless, vk::ImageLayout::eGeneral,
+                        frame->width, frame->height, "hudless", frame_dump_index);
+            }
+            std::printf("Stereo 3D: dump %d, scene %s, depth %ux%u, z = %g / (depth - %g)\n",
+                        frame_dump_index, scene.depth ? "yes" : "no", scene.width, scene.height,
+                        scene.depth_to_z[1], scene.depth_to_z[0]);
+        }
+        stereo->Compose(cmdbuf, frame->image, frame->image_view, frame->width, frame->height,
+                        hudless, hudless_view, scene);
+        if (!frame_generator->Wanted()) {
+            frame_generator->FinishFrame();
+        }
+    }
+
     // bbport: frame generation: the frames between the previous frame and this one.
     frame->generated_count = 0;
     // Above about 165 FPS (6 ms) the game is faster than displays show generated frames:
@@ -529,36 +609,12 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         reported_fast = true;
         std::printf("Frame generation: paused while the game runs above 165 FPS\n");
     }
-    if (frame_generator->Wanted() && !frame->is_hdr && !upscaled && !fast_game) {
+    if (frame_generator->Wanted() && stereo_on) {
+        // The generated frames would be flat between the eyes: none, but the captures used up.
+        frame_generator->FinishFrame();
+    } else if (frame_generator->Wanted() && !frame->is_hdr && !upscaled && !fast_game) {
         EnsureGenerated(frame);
-        // The picture before the UI, composed like the frame (equal outside the UI).
-        vk::Image hudless{};
-        vk::ImageView hudless_view{};
-        vk::Extent2D hudless_size{};
-        if (const auto source = frame_generator->Hudless(view_info.format, hudless_size);
-            source && hudless_size == image_size) {
-            if (hudless_frame.width != frame->width || hudless_frame.height != frame->height ||
-                !hudless_frame.image) {
-                RecreateFrame(&hudless_frame, frame->width, frame->height);
-            }
-            const vk::ImageMemoryBarrier2 to_target{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
-                .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-                .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
-                .oldLayout = vk::ImageLayout::eUndefined,
-                .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
-                .image = hudless_frame.image,
-                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-            };
-            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_target});
-            const auto scaled = fsr_pass.Render(cmdbuf, source, hudless_size,
-                                                {frame->width, frame->height}, fsr_settings,
-                                                frame->is_hdr);
-            pp_pass.Render(cmdbuf, scaled, hudless_size, hudless_frame, pp_settings);
-            hudless = hudless_frame.image;
-            hudless_view = hudless_frame.image_view;
-        }
+        compose_hudless();
         if (frame->generated[0].image) {
             std::array<FrameGenerator::Output, FrameGenerator::MaxGenerated> outputs{};
             for (u32 i = 0; i < outputs.size(); ++i) {
@@ -799,7 +855,21 @@ bool Presenter::PresentImage(Frame* frame, vk::Image image, bool last) {
     // bbport: the frame is blitted (letterboxed) straight into the swapchain image.
     const vk::Image swapchain_image = swapchain.Image();
     auto& scheduler = present_scheduler;
+    // bbport: stereo 3D for an SR panel: the side-by-side picture is woven in the swapchain
+    // image by D3D11 before the present (decided before the command buffer is taken: making the
+    // shared textures submits and waits on this scheduler).
+    auto& settings = ::BbSettings::Get();
+    const bool weave_wanted = sr_output && Stereo::Wanted() &&
+                              settings.stereo_output == ::BbSettings::StereoOutputSr && !swapchain.GetHDR();
+    const bool weave = weave_wanted &&
+                       sr_output->Ready(window.GetWindowInfo().render_surface, swapchain.GetSurfaceFormat().format,
+                                        swapchain.GetExtent().width, swapchain.GetExtent().height);
+    if (sr_output) {
+        sr_output->Lens(weave);
+        settings.stereo_sr_problem = weave_wanted && !weave ? sr_output->Problem() : nullptr;
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
+    bool overlay = false; // the menu or FPS counter drawn over the frame
 
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
@@ -857,15 +927,18 @@ bool Presenter::PresentImage(Frame* frame, vk::Image image, bool last) {
                          vk::Filter::eLinear);
         // bbport: the settings menu / FPS counter over the frame, at display resolution.
         BbOverlay::NotePresent();
-        const bool overlay = BbOverlay::Visible();
+        overlay = BbOverlay::Visible();
+        // Woven for an SR panel: the image stays where it is (the copy into D3D11 follows).
         const std::array post_barriers{
             vk::ImageMemoryBarrier{
                 .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
                 .dstAccessMask = overlay ? vk::AccessFlagBits::eColorAttachmentRead |
                                                vk::AccessFlagBits::eColorAttachmentWrite
-                                         : vk::AccessFlagBits::eNone,
+                                         : weave ? vk::AccessFlagBits::eTransferRead
+                                                 : vk::AccessFlagBits::eNone,
                 .oldLayout = vk::ImageLayout::eTransferDstOptimal,
                 .newLayout = overlay ? vk::ImageLayout::eColorAttachmentOptimal
+                             : weave ? vk::ImageLayout::eTransferDstOptimal
                                      : vk::ImageLayout::ePresentSrcKHR,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -887,7 +960,9 @@ bool Presenter::PresentImage(Frame* frame, vk::Image image, bool last) {
                                vk::PipelineStageFlagBits::eAllCommands,
                                vk::DependencyFlagBits::eByRegion, {}, {}, post_barriers);
         if (overlay) {
-            BbOverlay::Render(cmdbuf, swapchain.ImageView(), extent);
+            BbOverlay::Render(cmdbuf, swapchain.ImageView(), extent, Stereo::Wanted());
+        }
+        if (overlay && !weave) {
             const vk::ImageMemoryBarrier to_present{
                 .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
                 .dstAccessMask = vk::AccessFlagBits::eNone,
@@ -912,6 +987,29 @@ bool Presenter::PresentImage(Frame* frame, vk::Image image, bool last) {
     SubmitInfo info{};
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
+    if (weave) {
+        // bbport: the picture into the shared texture, woven by D3D11, and back (vk_sr_output.h):
+        // the present waits for the copy back.
+        sr_output->RecordCopyIn(cmdbuf, swapchain_image,
+                                overlay ? vk::ImageLayout::eColorAttachmentOptimal
+                                        : vk::ImageLayout::eTransferDstOptimal,
+                                info);
+        scheduler.Flush(info);
+        sr_output->Weave();
+        const auto back = scheduler.CommandBuffer();
+        SubmitInfo copy_out{};
+        sr_output->RecordCopyOut(back, swapchain_image, copy_out);
+        copy_out.AddSignal(swapchain.GetPresentReadySemaphore());
+        if (last) {
+            copy_out.AddSignal(frame->present_done);
+        }
+        scheduler.Flush(copy_out);
+        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        if (!swapchain.Present() && window.GetWidth() != 0 && window.GetHeight() != 0) {
+            swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        }
+        return true;
+    }
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     if (last) {
         // Also covers the generated frames' submissions before it on this queue.

@@ -30,8 +30,10 @@ void UpdateTextInput(SDL_Window* window);
 /// Whether anything is drawn this frame (menu open or FPS counter on).
 bool Visible();
 
-/// Present thread: draws into `view` (layout ColorAttachmentOptimal).
-void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
+/// Present thread: draws into `view` (layout ColorAttachmentOptimal). `side_by_side` (stereo
+/// 3D): drawn twice, squeezed into each half, so that both eyes see it at screen depth.
+void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
+            bool side_by_side = false);
 /// Every presented frame (FPS readout; BB_FPS_LOG=1 prints the rate every 5 seconds).
 void NotePresent();
 

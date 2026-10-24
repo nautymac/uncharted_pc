@@ -18,6 +18,12 @@ inline bool IsFsr4(int upscaler) {
 enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
 /// Frame generation (vk_frame_generation.h): frames generated between two of the game's.
 enum FrameGen : int { FrameGenOff = 0, FrameGenFsr3 = 1, FrameGenDlss = 2, FrameGenCount };
+/// Stereo 3D (vk_stereo.h): the two eyes side by side, made from the scene depth (sbs), or
+/// rendered by the game on alternate frames with its camera moved (alt, needs the camera hook).
+enum Stereo : int { StereoOff = 0, StereoSbs = 1, StereoAlt = 2, StereoCount };
+/// Where the stereo picture goes: the window side by side (a weaver or 3D display reads it), or
+/// woven for an SR panel in the window by the SR SDK (vk_sr_output.h; side by side without it).
+enum StereoOutput : int { StereoOutputSbs = 0, StereoOutputSr = 1, StereoOutputCount };
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
 
 /// Game effects switched by the community patches at start (patches.py EFFECTS): ini key,
@@ -95,6 +101,16 @@ struct Values {
     std::atomic<int> frame_gen_multiplier{2};
     std::atomic<int> dlssg_max_multiplier{1};
     std::atomic<const char*> frame_gen_problem{nullptr};
+    /// Stereo 3D: separation of the far distance and the near limit (% of the width per eye),
+    /// the view distance at screen depth (game units), left and right exchanged.
+    std::atomic<int> stereo{StereoOff};
+    std::atomic<float> stereo_depth{1.0f};
+    std::atomic<float> stereo_convergence{3.0f};
+    std::atomic<float> stereo_popout{1.0f};
+    std::atomic<bool> stereo_swap{false};
+    std::atomic<int> stereo_output{StereoOutputSr};
+    /// Why the SR panel's weaver is not in use, or null (set by the presenter).
+    std::atomic<const char*> stereo_sr_problem{nullptr};
 
     /// Startup settings for the explicit BB_RENDER_RES compatibility patch only.
     int startup_preset = NativeAA;
@@ -128,6 +144,8 @@ float PresetScale(int preset);
 const char* PresetName(int preset);
 const char* UpscalerName(int upscaler);
 const char* FrameGenName(int frame_gen);
+const char* StereoName(int stereo);
+const char* StereoOutputName(int output);
 
 /// Whether FSR 3.1 has been seen rendering correctly on this driver (a VkDriverId value).
 /// Nothing is on the list yet, so every driver gets the warning: on RADV PHOENIX (Mesa

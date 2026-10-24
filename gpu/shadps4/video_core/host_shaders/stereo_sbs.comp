@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: side-by-side stereo 3D from the game's own depth (vk_stereo.h). Each half of the
+// output is one eye, squeezed to half the width. The picture without UI moves sideways by each
+// pixel's view depth: a point at the convergence distance stays where it is, farther points
+// move apart up to `separation` (fraction of the width, per eye), nearer ones come out of the
+// screen up to `popout`. Every output pixel looks along its row for the surface that lands on
+// it, nearest first (a parallax search); where an eye sees what the centre camera did not, the
+// farther side is stretched. The UI (where the finished frame differs from the picture without
+// UI) stays at screen depth in both eyes. Frames without the scene are shown flat in both.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;   // the finished frame, output size
+layout(binding = 1) uniform sampler2D hudless_tex; // the frame without UI (or color_tex)
+layout(binding = 2) uniform texture2D depth_tex;   // R32F hardware depth, render size
+layout(binding = 3, rgba8) uniform writeonly image2D out_img; // side by side, output size
+
+layout(push_constant) uniform Constants {
+    ivec2 out_size;
+    ivec2 depth_size;
+    vec2 depth_to_z;   // view z = y / (depth - x)
+    float separation;  // shift of the far distance, fraction of the width (per eye)
+    float convergence; // view z drawn at screen depth
+    float popout;      // largest shift towards the viewer, fraction of the width
+    uint flags;        // 1: scene (depth valid), 2: picture without UI, 4: swap eyes
+};
+
+// The shift of the surface at `u` on depth row `row`, towards the left eye's right: positive in
+// front of the screen, negative behind it.
+float Shift(float u, int row) {
+    const int x = clamp(int(u * float(depth_size.x)), 0, depth_size.x - 1);
+    const float depth = texelFetch(depth_tex, ivec2(x, row), 0).r;
+    float z = abs(depth_to_z.y / (depth - depth_to_z.x));
+    if (!(z > 0.0) || isinf(z)) {
+        z = 1e30; // the far plane, or no depth written
+    }
+    return clamp(separation * (convergence / z - 1.0), -separation, popout);
+}
+
+bool IsUi(ivec2 pixel) {
+    const vec3 color = texelFetch(color_tex, pixel, 0).rgb;
+    const vec3 hudless = texelFetch(hudless_tex, pixel, 0).rgb;
+    const vec3 difference = abs(color - hudless);
+    // Both went through the same passes: equal outside the UI up to rounding.
+    return max(difference.r, max(difference.g, difference.b)) > 1.5 / 255.0;
+}
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= out_size.x || pixel.y >= out_size.y) {
+        return;
+    }
+    const int half_width = out_size.x / 2;
+    const bool right = pixel.x >= half_width;
+    const float u = (float(right ? pixel.x - half_width : pixel.x) + 0.5) / float(half_width);
+    const float v = (float(pixel.y) + 0.5) / float(out_size.y);
+    // The two frame pixels this squeezed one covers.
+    const int column = clamp(int(u * float(out_size.x) - 0.5), 0, out_size.x - 2);
+    if ((flags & 1u) == 0u ||
+        ((flags & 2u) != 0u && (IsUi(ivec2(column, pixel.y)) || IsUi(ivec2(column + 1, pixel.y))))) {
+        imageStore(out_img, pixel, vec4(textureLod(color_tex, vec2(u, v), 0.0).rgb, 1.0));
+        return;
+    }
+    // Left eye: what is near moves right (s = 1); right eye: left.
+    const bool swap = (flags & 4u) != 0u;
+    const float s = right != swap ? -1.0 : 1.0;
+    const int row = clamp(int(v * float(depth_size.y)), 0, depth_size.y - 1);
+    const float step = 1.0 / float(depth_size.x);
+    const int steps = int(ceil((popout + separation) / step)) + 2;
+    // From where the nearest possible surface would come from towards the farthest: the first
+    // surface that lands on or past this pixel is the one in front.
+    float source = u - s * popout;
+    float previous_source = source;
+    float previous_miss = -1.0;
+    float previous_shift = 0.0;
+    float sample_u = u;
+    for (int i = 0; i <= steps; ++i) {
+        const float shift = Shift(source, row);
+        const float miss = s * (source + s * shift - u);
+        if (miss >= 0.0) {
+            if (i == 0) {
+                sample_u = source;
+            } else if (abs(shift - previous_shift) > 1.5 * step) {
+                // A depth edge: the nearer texel covers this pixel only when it lands within
+                // half a texel; past that this eye sees behind it, and the farther side (the
+                // last texel that landed short) is stretched.
+                sample_u = miss <= 0.5 * step ? source : previous_source;
+            } else {
+                sample_u = mix(previous_source, source, previous_miss / (previous_miss - miss));
+            }
+            break;
+        }
+        previous_source = source;
+        previous_miss = miss;
+        previous_shift = shift;
+        source += s * step;
+    }
+    const vec2 at = vec2(sample_u, v);
+    const vec3 scene = (flags & 2u) != 0u ? textureLod(hudless_tex, at, 0.0).rgb
+                                          : textureLod(color_tex, at, 0.0).rgb;
+    imageStore(out_img, pixel, vec4(scene, 1.0));
+}

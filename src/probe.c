@@ -315,9 +315,165 @@ static int emulate_movbe(CONTEXT *c) {
     InterlockedIncrement64(&movbe_emulated);
     return 1;
 }
+/* BB_FIND_CAMERA=<frame> (stereo 3D diagnosis): where the game keeps the camera it renders with.
+ * The velocity pass's constants (CameraMotion::OnVelocityConstants, frame <frame> of them) give
+ * the camera's world position and axes and the projection; guest memory is searched for those
+ * values, the hits are printed with the floats around them, and the pages of the position and
+ * axis hits are write-protected once: the next write to each is reported with the writer's guest
+ * offset and rbp chain, then let through. Stand still in the game, so that every copy of the
+ * camera holds the frame's values. */
+typedef struct { uintptr_t page; char label[16]; volatile LONG armed; } CameraWatch;
+static CameraWatch camera_watches[24];
+static volatile LONG camera_watch_count;
+static void print_rbp_chain(const CONTEXT *c, int frames) {
+    char where[MAX_PATH+64];
+    uintptr_t rbp=(uintptr_t)c->Rbp;
+    for (int depth=0; depth<frames && rbp; ++depth) {
+        uintptr_t frame[2];
+        SIZE_T got=0;
+        if (!ReadProcessMemory(GetCurrentProcess(),(void *)rbp,frame,sizeof(frame),&got) || got!=sizeof(frame) || frame[0]<=rbp) break;
+        describe_address(where,sizeof(where),frame[1]);
+        fprintf(stderr,"    #%d %s\n",depth,where);
+        rbp=frame[0];
+    }
+}
+static int camera_watch_hit(EXCEPTION_POINTERS *info, uintptr_t address) {
+    const uintptr_t page=address&~(uintptr_t)0xfff;
+    const LONG n=camera_watch_count;
+    for (LONG i=0;i<n;++i) {
+        CameraWatch *w=&camera_watches[i];
+        if (w->page!=page || !InterlockedExchange(&w->armed,0)) continue;
+        DWORD old;
+        VirtualProtect((void *)page,4096,PAGE_READWRITE,&old);
+        const CONTEXT *c=info->ContextRecord;
+        char where[MAX_PATH+64];
+        describe_address(where,sizeof(where),(uintptr_t)c->Rip);
+        fprintf(stderr,"Camera watch: %s page %p: write to %p by %s (thread %lu)\n",w->label,(void *)page,(void *)address,where,GetCurrentThreadId());
+        print_rbp_chain(c,10);
+        fflush(stderr);
+        return 1;
+    }
+    return 0;
+}
+/* BB_WATCH_OBJECT=<image offset>[,<bytes>] (stereo 3D diagnosis): every write into that object
+ * of the game's data (default 0x2b0 bytes, the render camera) is reported with the writer's guest
+ * offset and the field written, the first 40 with the writer's rbp chain, up to 400 writes. The
+ * object's pages are write-protected; a write elsewhere in them, and every reported write, is let
+ * through by single-stepping the instruction with the page writable, then protecting it again. */
+static uintptr_t watch_object, watch_object_end;
+static volatile LONG watch_object_hits;
+static __thread uintptr_t watch_object_rearm; /* the page to protect again after the single step */
+static void watch_object_protect(uintptr_t page, DWORD protect) {
+    DWORD old;
+    VirtualProtect((void *)page,4096,protect,&old);
+}
+static int watch_object_hit(EXCEPTION_POINTERS *info, uintptr_t address) {
+    const uintptr_t page=address&~(uintptr_t)0xfff;
+    if (!watch_object || page<(watch_object&~(uintptr_t)0xfff) || page>=watch_object_end) return 0;
+    CONTEXT *c=info->ContextRecord;
+    if (address>=watch_object && address<watch_object_end) {
+        const LONG hit=InterlockedIncrement(&watch_object_hits);
+        if (hit<=400) {
+            char where[MAX_PATH+64];
+            describe_address(where,sizeof(where),(uintptr_t)c->Rip);
+            fprintf(stderr,"Object watch: +%#llx written by %s (thread %lu)\n",(unsigned long long)(address-watch_object),where,GetCurrentThreadId());
+            if (hit<=40) print_rbp_chain(c,8);
+            if (hit==400) fprintf(stderr,"Object watch: no more reports\n");
+            fflush(stderr);
+        }
+    }
+    /* Let the write through: writable for one instruction (trap flag), then protected again. */
+    watch_object_protect(page,PAGE_READWRITE);
+    watch_object_rearm=page;
+    c->EFlags|=0x100;
+    return 1;
+}
+static int watch_object_step(EXCEPTION_POINTERS *info) {
+    if (!watch_object_rearm) return 0;
+    watch_object_protect(watch_object_rearm,PAGE_READONLY);
+    watch_object_rearm=0;
+    info->ContextRecord->EFlags&=~(DWORD)0x100;
+    return 1;
+}
+static void watch_object_start(void) {
+    const char *spec=getenv("BB_WATCH_OBJECT");
+    if (!spec || !*spec || !image) return;
+    char *end;
+    const uint64_t offset=strtoull(spec,&end,16);
+    const uint64_t bytes=*end==',' ? strtoull(end+1,NULL,16) : 0x2b0;
+    watch_object=(uintptr_t)image+offset;
+    watch_object_end=watch_object+bytes;
+    for (uintptr_t page=watch_object&~(uintptr_t)0xfff;page<watch_object_end;page+=4096) watch_object_protect(page,PAGE_READONLY);
+    fprintf(stderr,"Object watch: image+%#llx, %llu bytes, pages %p..%p\n",(unsigned long long)offset,(unsigned long long)bytes,
+            (void *)(watch_object&~(uintptr_t)0xfff),(void *)watch_object_end);
+    fflush(stderr);
+}
+/* Committed, readable guest memory (the PS4 range) searched for `n` bytes at 4-byte alignment. */
+static size_t scan_guest(const void *needle, size_t n, uintptr_t *hits, size_t max) {
+    const unsigned char first=*(const unsigned char *)needle;
+    size_t count=0;
+    MEMORY_BASIC_INFORMATION mi;
+    for (uintptr_t at=UINT64_C(0x1000000000); at<UINT64_C(0xfc00000000) && count<max;) {
+        if (!VirtualQuery((const void *)at,&mi,sizeof(mi))) break;
+        const uintptr_t end=(uintptr_t)mi.BaseAddress+mi.RegionSize;
+        const DWORD p=mi.Protect&0xff;
+        if (mi.State==MEM_COMMIT && !(mi.Protect&PAGE_GUARD) &&
+            (p==PAGE_READWRITE || p==PAGE_READONLY || p==PAGE_EXECUTE_READ || p==PAGE_EXECUTE_READWRITE)) {
+            const unsigned char *m=(const unsigned char *)mi.BaseAddress;
+            for (size_t i=0;i+n<=mi.RegionSize && count<max;i+=4)
+                if (m[i]==first && !memcmp(m+i,needle,n)) hits[count++]=(uintptr_t)m+i;
+        }
+        at=end;
+    }
+    return count;
+}
+void runtime_find_camera_writers(const float *c) {
+    static const struct { const char *label; int first, stride, count; } patterns[]={
+        {"position",15,4,3}, {"right axis",12,4,3}, {"up axis",13,4,3}, {"row0",12,1,4},
+        {"prev clip row0",40,1,4}, {"uv to view",0,1,4},
+    };
+    fprintf(stderr,"Camera search: velocity constants\n");
+    for (int i=0;i<64;i+=8) {
+        fprintf(stderr,"  c%-2d",i);
+        for (int k=0;k<8;++k) fprintf(stderr," %11.6g",c[i+k]);
+        fprintf(stderr,"\n");
+    }
+    for (size_t p=0;p<sizeof(patterns)/sizeof(*patterns);++p) {
+        float needle[4];
+        for (int k=0;k<patterns[p].count;++k) needle[k]=c[patterns[p].first+k*patterns[p].stride];
+        uintptr_t hits[12];
+        const size_t n=scan_guest(needle,(size_t)patterns[p].count*4,hits,12);
+        fprintf(stderr,"Camera search: %s (%g %g %g%s): %zu hits\n",patterns[p].label,needle[0],needle[1],needle[2],
+                patterns[p].count==4 ? " ..." : "",n);
+        for (size_t h=0;h<n;++h) {
+            const float *f=(const float *)(hits[h]-48);
+            MEMORY_BASIC_INFORMATION mi;
+            fprintf(stderr,"  %p:",(void *)hits[h]);
+            if (VirtualQuery(f,&mi,sizeof(mi)) && mi.State==MEM_COMMIT && (uintptr_t)mi.BaseAddress+mi.RegionSize>=hits[h]+64)
+                for (int k=0;k<28;++k) fprintf(stderr,"%s%.5g",k==12 ? " |" : " ",f[k]);
+            fprintf(stderr,"\n");
+            if (p<3 && camera_watch_count<(LONG)(sizeof(camera_watches)/sizeof(*camera_watches))) {
+                const uintptr_t page=hits[h]&~(uintptr_t)0xfff;
+                int known=0;
+                for (LONG w=0;w<camera_watch_count;++w) if (camera_watches[w].page==page) known=1;
+                if (known) continue;
+                CameraWatch *w=&camera_watches[camera_watch_count];
+                w->page=page;
+                snprintf(w->label,sizeof(w->label),"%s",patterns[p].label);
+                w->armed=1;
+                InterlockedIncrement(&camera_watch_count);
+                DWORD old;
+                if (!VirtualProtect((void *)page,4096,PAGE_READONLY,&old)) fprintf(stderr,"  (cannot protect page %p: %lu)\n",(void *)page,GetLastError());
+            }
+        }
+    }
+    fprintf(stderr,"Camera search: %ld pages watched\n",camera_watch_count);
+    fflush(stderr);
+}
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
+    if (code==EXCEPTION_SINGLE_STEP && watch_object_step(info)) return EXCEPTION_CONTINUE_EXECUTION;
     /* Instructions this CPU lacks (cpu_patch.c): a rewritten breakpoint (Rip at the int3) or one
      * the scan missed continue in a thunk. */
     if (code==EXCEPTION_BREAKPOINT || code==EXCEPTION_ILLEGAL_INSTRUCTION) {
@@ -328,6 +484,15 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
         }
     }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
+        /* A camera page watched for its writer (BB_FIND_CAMERA): reported and let through. */
+        if (camera_watch_count && record->ExceptionInformation[0]==1 &&
+            camera_watch_hit(info,(uintptr_t)record->ExceptionInformation[1])) {
+            if (gpu_enabled) bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1]);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        /* An object of the game's data watched for its writers (BB_WATCH_OBJECT). */
+        if (watch_object && record->ExceptionInformation[0]==1 &&
+            watch_object_hit(info,(uintptr_t)record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
         /* GPU page tracking (write-protected guest pages) is resolved first. */
         if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) {
             red_zone_fault_handled(info->ContextRecord->Rip);
@@ -1256,6 +1421,9 @@ int main(int argc, char **argv) {
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
     install_guest_hooks(segments, ns);
+#ifdef _WIN32
+    watch_object_start();
+#endif
     {
         uint64_t image_end=0;
         for (uint64_t s=0;s<ns;++s) if (segments[s].address+segments[s].size>image_end) image_end=segments[s].address+segments[s].size;
