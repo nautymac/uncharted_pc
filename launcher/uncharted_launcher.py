@@ -40,9 +40,12 @@ CONFIG_FILE = CONFIG_DIR / 'settings.json'
 NAME = 'Uncharted'
 AUTHOR = 'SuperMedo'
 # This build; GitHub release tags are v<VERSION> (their digits are compared).
-VERSION = '0.3.9'
-RELEASES_API = 'https://api.github.com/repos/Supermedo/uncharted_pc/releases/latest'
-RELEASES_PAGE = 'https://github.com/Supermedo/uncharted_pc/releases/latest'
+# The stereo 3D build (branch stereo-3d) is an add-on over the original PC port of the version
+# before "-3d": it looks for updates among the fork's releases (pre-releases too), whose zip is the
+# add-on, because installing a newer original package over it would remove the 3D build.
+VERSION = '0.3.9-3d.1'
+RELEASES_API = 'https://api.github.com/repos/nautymac/uncharted_pc/releases?per_page=1'
+RELEASES_PAGE = 'https://github.com/nautymac/uncharted_pc/releases'
 UPDATE_DIR = Path(tempfile.gettempdir()) / 'uncharted-update'
 # Never copied over an installation by an update (the package does not hold them either).
 USER_FILES = ('user', 'out', 'art', 'bbport.ini', 'input.ini', 'last_run.log')
@@ -2764,6 +2767,8 @@ def latest_release():
                                                             'User-Agent': 'uncharted-launcher'})
     with urllib.request.urlopen(request, timeout=15) as response:
         release = json.load(response)
+    if isinstance(release, list):  # the releases list (newest first) rather than releases/latest
+        release = release[0]
     version = '.'.join(re.findall(r'\d+', release['tag_name']))
     url = next((asset['browser_download_url'] for asset in release.get('assets', [])
                 if asset.get('name', '').lower().endswith('.zip')), None)
