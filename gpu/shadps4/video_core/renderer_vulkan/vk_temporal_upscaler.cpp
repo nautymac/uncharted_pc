@@ -467,7 +467,7 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
     }
     // Before the upscale: it changes the scene color only, and frame generation runs with
     // the upscaler off as well.
-    if (frame_generator && frame_generator->Capturing() && camera_motion.VelocityMode() &&
+    if (frame_generator && frame_generator->Wanted() && camera_motion.VelocityMode() &&
         !frame_gen_captured) {
         frame_gen_captured = true;
         CaptureFrameGen();
@@ -1391,7 +1391,7 @@ void TemporalUpscaler::CaptureFrameGen() {
     if (const vk::ImageView motion = frame_generator->BeginCapture(cmdbuf, depth_view, w, h)) {
         camera_motion.RecordVelocity(cmdbuf, depth_view, motion, w, h);
         frame_generator->EndCapture(cmdbuf, Active() ? jitter : std::array<float, 2>{},
-                                    camera_motion.Ready(), camera_motion.DepthToZ());
+                                    camera_motion.Ready());
     }
 }
 
@@ -1399,7 +1399,7 @@ void TemporalUpscaler::OnDrawRecorded(u64 ps_hash, VideoCore::ImageId color) {
     // This draw starts the upscaler's next frame (OnFrameStart: it writes the display buffer);
     // the frame generator knows whether this frame's inputs were taken.
     if (!hudless_hash || u32(ps_hash) != hudless_hash || !color || !frame_generator ||
-        !frame_generator->Capturing()) {
+        !frame_generator->Wanted()) {
         return;
     }
     auto& image = texture_cache.GetImage(color);

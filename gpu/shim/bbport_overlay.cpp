@@ -158,13 +158,12 @@ constexpr float StereoNoticeSeconds = 2.5f;
 
 void ShowStereoNotice() {
     auto& s = BbSettings::Get();
-    static constexpr const char* modes[BbSettings::StereoCount] = {
-        "3D off", "3D: depth reprojection", "3D: alternate frames", "3D: one pass (multiview)"};
-    const float depth = s.stereo_depth.load();
+    static constexpr const char* modes[BbSettings::StereoCount] = {"3D off",
+                                                                    "3D: one pass (multiview)"};
     std::snprintf(stereo_notice_text, sizeof(stereo_notice_text),
-                  "%s      depth %.2f  (%.1f mm per eye)      convergence %.2f m%s",
-                  modes[std::clamp(s.stereo.load(), 0, BbSettings::StereoCount - 1)], depth,
-                  depth * 32.0f, s.stereo_convergence.load(),
+                  "%s      depth %.2f %% of the width      convergence %.2f m%s",
+                  modes[std::clamp(s.stereo.load(), 0, BbSettings::StereoCount - 1)],
+                  s.stereo_depth.load(), s.stereo_convergence.load(),
                   s.stereo_swap ? "      eyes swapped" : "");
     stereo_notice_start = std::chrono::steady_clock::now();
     stereo_notice_busy = true;
@@ -188,7 +187,7 @@ bool StereoKey(SDL_Keycode key, bool repeat) {
     last_step = now;
     auto& s = BbSettings::Get();
     switch (key) {
-    case SDLK_F3: // off -> sbs -> alt -> geo -> off
+    case SDLK_F3: // off -> geo -> off (geo draws flat unless chosen at start)
         s.stereo = (s.stereo + 1) % BbSettings::StereoCount;
         break;
     case SDLK_F5:
@@ -218,10 +217,9 @@ bool StereoKey(SDL_Keycode key, bool repeat) {
     default:
         return false;
     }
-    std::printf("Stereo 3D: %s, depth %.2f%%, convergence %.3f, pop-out %.2f%%%s\n",
+    std::printf("Stereo 3D: %s, depth %.2f%%, convergence %.3f%s\n",
                 BbSettings::StereoName(s.stereo), s.stereo_depth.load(),
-                s.stereo_convergence.load(), s.stereo_popout.load(),
-                s.stereo_swap ? ", eyes swapped" : "");
+                s.stereo_convergence.load(), s.stereo_swap ? ", eyes swapped" : "");
     ShowStereoNotice();
     BbSettings::Save();
     return true;
@@ -424,9 +422,7 @@ void Menu() {
     }
 
     ImGui::SeparatorText("3D (stereo)");
-    static const char* stereo_modes[] = {"Off", "Side by side from depth (SBS)",
-                                         "Alternate frames (camera hook)",
-                                         "One pass, both eyes (multiview)"};
+    static const char* stereo_modes[] = {"Off", "One pass, both eyes (multiview)"};
     const int stereo = s.stereo;
     if (ImGui::BeginCombo("3D output", stereo_modes[stereo])) {
         for (int i = 0; i < BbSettings::StereoCount; ++i) {
@@ -436,11 +432,10 @@ void Menu() {
         }
         ImGui::EndCombo();
     }
-    Hint("Both eyes side by side, made from the game's own depth, for 3D displays and weavers "
-         "(SRCapture3D --mode sbs). The UI stays at screen depth. Frame generation is off "
-         "while it is on. One pass: both eyes drawn from the same frame into two layers of "
-         "the scene targets (no time difference between the eyes); the layers exist only when "
-         "geo is set before the start, and the upscaler is off. Keys: Ctrl+F3 mode, "
+    Hint("Both eyes drawn from the same frame into two layers of the scene targets (no time "
+         "difference between the eyes); the UI stays at screen depth. The layers exist only "
+         "when 3D is set before the start (the launcher's 3D page or stereo=geo in bbport.ini), "
+         "and the upscaler and frame generation are off while it is on. Keys: Ctrl+F3 on/off, "
          "Ctrl+F5/F6 depth, Ctrl+F7/F8 convergence, Ctrl+F9 swap eyes.");
     ImGui::BeginDisabled(s.stereo == BbSettings::StereoOff);
     Slider("Depth (% of width)", s.stereo_depth, 0.0f, 5.0f);
@@ -449,7 +444,6 @@ void Menu() {
           ImGui::SliderFloat("Convergence", &convergence, 0.1f, 100.0f, "%.2f",
                              ImGuiSliderFlags_Logarithmic));
     Hint("The view distance shown at screen depth: nearer comes out of the screen.");
-    Slider("Pop-out limit (%)", s.stereo_popout, 0.0f, 5.0f);
     Checkbox("Swap eyes", s.stereo_swap);
     static const char* stereo_outputs[] = {"Side by side in the window", "SR panel (woven in the window)"};
     const int stereo_output = s.stereo_output;

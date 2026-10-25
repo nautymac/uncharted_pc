@@ -97,9 +97,7 @@ XESS = ('xess', 'Intel XeSS (Native AA, any GPU)')
 AA_SHARPNESS = [('0', 'Off'), ('0.2', 'Low'), ('0.4', 'Medium'), ('0.7', 'High')]
 # Frames generated between two of the game's (BB_FRAME_GEN, BB_FRAME_GEN_MULTIPLIER).
 # Stereo 3D (gpu/shim/bbport_settings.h): how the eyes are made, and where the picture goes.
-STEREO_MODES = [('off', 'Off'), ('alt', 'Alternate frames (the game draws each eye)'),
-                ('geo', 'One pass: both eyes from the same frame (multiview)'),
-                ('sbs', 'From the depth buffer (one picture, reprojected)')]
+STEREO_MODES = [('off', 'Off'), ('geo', 'One pass: both eyes from the same frame (multiview)')]
 STEREO_OUTPUTS = [('sr', 'SR panel (woven in the window)'), ('sbs', 'Side by side in the window')]
 FRAME_GENERATION = [('off', 'Off'), ('fsr3', 'AMD FSR 3 Frame Generation (any GPU)'),
                     ('dlss', 'NVIDIA DLSS Frame Generation (GeForce RTX 40/50)')]
@@ -355,7 +353,7 @@ STEREO_DISPLAY_NAMES = {'fullscreen': 'Fullscreen', 'present_mode': 'Presentatio
 
 
 def stereo_display_defaults(stereo):
-    return {'fullscreen': True, 'present_mode': 'Mailbox', 'frame_rate': '120' if stereo == 'alt' else '60',
+    return {'fullscreen': True, 'present_mode': 'Mailbox', 'frame_rate': '60',
             'window_size': '1920x1080', 'render_height': '1080', 'aspect': '16:9',
             'anti_aliasing': 'off', 'frame_generation': 'off'}
 
@@ -1533,12 +1531,9 @@ class Launcher:
     def build_3d(self):
         f = self.page('3d', _('3D'), _('Stereoscopic 3D for an SR panel or a side-by-side 3D display.'))
         self.row(f, _('3D'), self.choice(f, 'stereo', STEREO_MODES, 40, on_change=self.stereo_mode_changed),
-                 _('Alternate frames: the game draws the left and the right eye on alternate frames, with its '
-                   'camera moved (the 120 FPS frame rate gives 60 per eye; set Mailbox presentation). One pass: '
-                   'both eyes are drawn from the same frame into two layers of the scene targets (no time '
-                   'difference between the eyes; the upscaler is switched off, and the mode must be set here, '
-                   'before the start). From the depth buffer: one picture reprojected into two eyes, cheaper but '
-                   'with soft edges where one eye sees behind things. Frame generation is off while 3D is on.'))
+                 _('One pass: both eyes are drawn from the same frame into two layers of the scene targets '
+                   '(no time difference between the eyes); the UI stays at screen depth. The mode must be set '
+                   'here, before the start; the upscaler and frame generation are off while 3D is on.'))
         # Choosing a 3D mode sets the Display page to the settings it was tested with
         # (stereo_display_defaults); this warns while the Display page differs from them.
         holder = self.tk.Frame(self.target(f), bg=CARD)
@@ -1560,8 +1555,9 @@ class Launcher:
         self.row(f, _('Eye separation'),
                  Slider(self.tk, self.target(f), self.var('stereo_depth'), 0.0, 5.0, 0.05, COLORS, self.px,
                         self.font_ui_md, width=300, entry=True),
-                 _('1.0 is about the distance between two eyes (3.2 cm per eye in the game\'s world). '
-                   'Larger: deeper, but harder to fuse. In the game: Ctrl+F5 / Ctrl+F6.'))
+                 _('The shift of the far distance, % of the picture width per eye (1.0 is about an eye '
+                   'distance on a 27-inch screen). Larger: deeper, but harder to fuse. In the game: '
+                   'Ctrl+F5 / Ctrl+F6.'))
         self.row(f, _('Convergence'),
                  Slider(self.tk, self.target(f), self.var('stereo_convergence'), 0.1, 100.0, 0.1, COLORS, self.px,
                         self.font_ui_md, width=300, log=True, entry=True, suffix=' m'),

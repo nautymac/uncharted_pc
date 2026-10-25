@@ -123,24 +123,6 @@ bool FrameGenerator::Wanted() const {
     return BbSettings::Get().frame_gen != BbSettings::FrameGenOff;
 }
 
-bool FrameGenerator::Capturing() const {
-    // The geo stereo mode draws both eyes itself: no depth or picture to take.
-    const int stereo = BbSettings::Get().stereo;
-    return Wanted() || (stereo != BbSettings::StereoOff && stereo != BbSettings::StereoGeo);
-}
-
-FrameGenerator::StereoScene FrameGenerator::Scene() const {
-    if (!captured || !capture_camera || !depth_view) {
-        return {};
-    }
-    return {*depth_view, input_width, input_height, capture_depth_to_z};
-}
-
-void FrameGenerator::FinishFrame() {
-    captured = false;
-    hudless_captured = false;
-}
-
 void FrameGenerator::CreatePipeline() {
     if (pipeline) {
         return;
@@ -235,7 +217,7 @@ void FrameGenerator::EnsureInputs(u32 w, u32 h) {
 
 vk::ImageView FrameGenerator::BeginCapture(vk::CommandBuffer cmdbuf, vk::ImageView depth, u32 w,
                                            u32 h) {
-    if (!Capturing() || !depth || !w || !h) {
+    if (!Wanted() || !depth || !w || !h) {
         return {};
     }
     CreatePipeline();
@@ -275,7 +257,7 @@ vk::ImageView FrameGenerator::BeginCapture(vk::CommandBuffer cmdbuf, vk::ImageVi
 }
 
 void FrameGenerator::EndCapture(vk::CommandBuffer cmdbuf, std::array<float, 2> jitter,
-                                bool motion_valid, std::array<float, 2> depth_to_z) {
+                                bool motion_valid) {
     std::array<vk::ImageMemoryBarrier2, 2> to_read{};
     for (u32 i = 0; i < 2; ++i) {
         to_read[i] = {
@@ -297,13 +279,11 @@ void FrameGenerator::EndCapture(vk::CommandBuffer cmdbuf, std::array<float, 2> j
     }
     captured = true;
     capture_jitter = jitter;
-    capture_camera = motion_valid;
-    capture_depth_to_z = depth_to_z;
 }
 
 void FrameGenerator::CaptureHudless(vk::CommandBuffer cmdbuf, vk::Image source, vk::Format format,
                                     u32 w, u32 h) {
-    if (!Capturing() || !captured || hudless_captured || !w || !h) {
+    if (!Wanted() || !captured || hudless_captured || !w || !h) {
         return; // only for a frame with the game's scene, and before its UI
     }
     if (!hudless_image || hudless_format != format || hudless_width != w || hudless_height != h) {

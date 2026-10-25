@@ -388,8 +388,6 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
     return {};
 }
 
-extern "C" int bbgpu_stereo_frame_eye(void); // vk_camera_motion.cpp
-
 // bbport: raw copy of an image for BB_FRAME_DUMP_TRIGGER, written once the GPU is done.
 static void DumpRaw(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
                     vk::Image image, vk::ImageLayout layout, u32 w, u32 h, const char* name,
@@ -564,17 +562,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     // bbport: stereo 3D: the two eyes side by side replace the frame (no frame generation).
     const bool stereo_on = Stereo::Wanted();
-    if (stereo_on && ::BbSettings::Get().stereo == ::BbSettings::StereoAlt) {
-        // Alternate frames: this frame is one eye (the camera hook's record, read from the
-        // frame's velocity pass), or flat without one.
-        const auto scene = upscaled ? FrameGenerator::StereoScene{} : frame_generator->Scene();
-        const int eye = scene.depth ? bbgpu_stereo_frame_eye() : 0;
-        stereo->ComposeAlternate(cmdbuf, frame->image, frame->image_view, frame->width,
-                                 frame->height, eye);
-        if (!frame_generator->Wanted()) {
-            frame_generator->FinishFrame();
-        }
-    } else if (stereo_on && ::BbSettings::Get().stereo == ::BbSettings::StereoGeo) {
+    if (stereo_on) {
         // One pass (multiview, shader_recompiler/stereo.h): the display buffer's two layers
         // hold the eyes. The right eye's layer goes through the same scaling and post passes
         // into a second frame and the pair is packed side by side. A one-layer buffer (geo not
@@ -628,37 +616,6 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         stereo->ComposePair(cmdbuf, frame->image, frame->image_view, right_image,
                             right_view ? stereo_right_frame.image_view : vk::ImageView{},
                             frame->width, frame->height);
-        if (!frame_generator->Wanted()) {
-            frame_generator->FinishFrame();
-        }
-    } else if (stereo_on) {
-        if (!upscaled) {
-            compose_hudless();
-        }
-        const auto scene = upscaled ? FrameGenerator::StereoScene{} : frame_generator->Scene();
-        if (frame_dump) {
-            // The frame and the picture without UI before the eyes are made, and the camera
-            // (the depth is fg_depth, written at its capture).
-            const vk::MemoryBarrier2 done{.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                                          .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-                                          .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                                          .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
-            cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &done});
-            DumpRaw(instance, draw_scheduler, cmdbuf, frame->image, vk::ImageLayout::eGeneral,
-                    frame->width, frame->height, "center", frame_dump_index);
-            if (hudless) {
-                DumpRaw(instance, draw_scheduler, cmdbuf, hudless, vk::ImageLayout::eGeneral,
-                        frame->width, frame->height, "hudless", frame_dump_index);
-            }
-            std::printf("Stereo 3D: dump %d, scene %s, depth %ux%u, z = %g / (depth - %g)\n",
-                        frame_dump_index, scene.depth ? "yes" : "no", scene.width, scene.height,
-                        scene.depth_to_z[1], scene.depth_to_z[0]);
-        }
-        stereo->Compose(cmdbuf, frame->image, frame->image_view, frame->width, frame->height,
-                        hudless, hudless_view, scene);
-        if (!frame_generator->Wanted()) {
-            frame_generator->FinishFrame();
-        }
     }
 
     // bbport: frame generation: the frames between the previous frame and this one.
@@ -672,8 +629,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         std::printf("Frame generation: paused while the game runs above 165 FPS\n");
     }
     if (frame_generator->Wanted() && stereo_on) {
-        // The generated frames would be flat between the eyes: none, but the captures used up.
-        frame_generator->FinishFrame();
+        // The generated frames would be flat between the eyes: none.
     } else if (frame_generator->Wanted() && !frame->is_hdr && !upscaled && !fast_game) {
         EnsureGenerated(frame);
         compose_hudless();
