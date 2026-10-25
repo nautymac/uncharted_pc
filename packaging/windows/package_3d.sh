@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bbport (Uncharted) stereo 3D add-on: dist/uncharted-3d-windows.zip, unpacked over the original
 # PC port's uncharted-windows.zip. Only what the original does not have: bin/bb-probe.exe (the 3D
-# build, stripped), bin/ps2sr.dll (the SR panel weaver bridge), the batch files (SR monitor / side by side) and the README
+# build, stripped), bin/ps2sr.dll (the SR panel weaver bridge), the batch files (SR monitor / side by side) and the two READMEs (Korean, English)
 # (packaging/windows/3d/) and the MSYS2 DLLs bb-probe.exe loads: the original package's DLLs
 # are from its own MSYS2 build and the 3D executable fails to start on them (entry point not
 # found, 0xc0000139). BB_3D_WITH_DLLS=0 leaves them out. Run from an MSYS2 CLANG64 shell.
@@ -23,7 +23,7 @@ if [[ ${BB_3D_WITH_DLLS:-1} == 1 ]]; then
     done
 fi
 cp packaging/windows/3d/Uncharted-3D-SR.bat packaging/windows/3d/Uncharted-3D-SBS.bat \
-   packaging/windows/3d/README-3D.txt "$dest/"
+   packaging/windows/3d/README-3D-KO.txt packaging/windows/3d/README-3D-EN.txt "$dest/"
 # The batch files need CRLF for cmd.exe.
 for bat in "$dest"/*.bat; do sed -i 's/\r$//; s/$/\r/' "$bat"; done
 mkdir -p dist
