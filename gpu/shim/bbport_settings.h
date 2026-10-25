@@ -18,9 +18,11 @@ inline bool IsFsr4(int upscaler) {
 enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
 /// Frame generation (vk_frame_generation.h): frames generated between two of the game's.
 enum FrameGen : int { FrameGenOff = 0, FrameGenFsr3 = 1, FrameGenDlss = 2, FrameGenCount };
-/// Stereo 3D (vk_stereo.h): the two eyes side by side, made from the scene depth (sbs), or
-/// rendered by the game on alternate frames with its camera moved (alt, needs the camera hook).
-enum Stereo : int { StereoOff = 0, StereoSbs = 1, StereoAlt = 2, StereoCount };
+/// Stereo 3D (vk_stereo.h): the two eyes side by side, made from the scene depth (sbs),
+/// rendered by the game on alternate frames with its camera moved (alt, needs the camera hook),
+/// or both drawn from the same frame into the two layers of the scene targets by multiview
+/// (geo, shader_recompiler/stereo.h; the layers are made at start, the upscaler is off).
+enum Stereo : int { StereoOff = 0, StereoSbs = 1, StereoAlt = 2, StereoGeo = 3, StereoCount };
 /// Where the stereo picture goes: the window side by side (a weaver or 3D display reads it), or
 /// woven for an SR panel in the window by the SR SDK (vk_sr_output.h; side by side without it).
 enum StereoOutput : int { StereoOutputSbs = 0, StereoOutputSr = 1, StereoOutputCount };
@@ -111,6 +113,8 @@ struct Values {
     std::atomic<int> stereo_output{StereoOutputSr};
     /// Why the SR panel's weaver is not in use, or null (set by the presenter).
     std::atomic<const char*> stereo_sr_problem{nullptr};
+    /// Why the geo mode draws flat here (no multiview on this GPU), or null (the rasterizer).
+    std::atomic<const char*> stereo_geo_problem{nullptr};
 
     /// Startup settings for the explicit BB_RENDER_RES compatibility patch only.
     int startup_preset = NativeAA;
@@ -120,6 +124,7 @@ struct Values {
     int startup_model_lod = 0;
     int startup_output_res = OutputDefault;
     int startup_live_resolution = 0;
+    int startup_stereo = StereoOff;
 };
 
 Values& Get();
@@ -146,6 +151,9 @@ const char* UpscalerName(int upscaler);
 const char* FrameGenName(int frame_gen);
 const char* StereoName(int stereo);
 const char* StereoOutputName(int output);
+/// The scene targets get a second layer for the geo stereo mode: decided at start (stereo=geo
+/// in the file or BB_STEREO; BB_STEREO_GEO_LAYERS=1 forces the layers for a switch by key).
+bool StereoGeoLayers();
 
 /// Whether FSR 3.1 has been seen rendering correctly on this driver (a VkDriverId value).
 /// Nothing is on the list yet, so every driver gets the warning: on RADV PHOENIX (Mesa

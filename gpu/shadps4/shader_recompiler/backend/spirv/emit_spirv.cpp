@@ -324,6 +324,9 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     if (stage == SwStage::Geometry) {
         ctx.AddCapability(spv::Capability::Geometry);
     }
+    if (Sirit::ValidId(ctx.view_index)) {
+        ctx.AddCapability(spv::Capability::MultiView); // bbport: stereo 3D in one pass
+    }
     if (info.hw_stage == HwStage::Fragment) {
         if (profile.supports_amd_shader_explicit_vertex_parameter) {
             ctx.AddExtension("SPV_AMD_shader_explicit_vertex_parameter");

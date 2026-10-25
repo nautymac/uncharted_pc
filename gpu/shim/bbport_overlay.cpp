@@ -148,11 +148,47 @@ void Slider(const char* label, std::atomic<float>& value, float lo, float hi) {
     Store(value, v, ImGui::SliderFloat(label, &v, lo, hi, "%.2f"));
 }
 
-// Stereo 3D keys, menu open or not (Ctrl+F3, Ctrl+F5..F9): true when `key` is one.
-bool StereoKey(SDL_Keycode key) {
+// ---- Stereo 3D notice: the values after a key press, at the top of the picture for a moment -----
+// Text and start are written under imgui_mutex (ProcessEvent) and read under it (Render); the flag
+// alone is read without it (Visible).
+std::atomic<bool> stereo_notice_busy{false};
+std::chrono::steady_clock::time_point stereo_notice_start;
+char stereo_notice_text[160] = "";
+constexpr float StereoNoticeSeconds = 2.5f;
+
+void ShowStereoNotice() {
+    auto& s = BbSettings::Get();
+    static constexpr const char* modes[BbSettings::StereoCount] = {
+        "3D off", "3D: depth reprojection", "3D: alternate frames", "3D: one pass (multiview)"};
+    const float depth = s.stereo_depth.load();
+    std::snprintf(stereo_notice_text, sizeof(stereo_notice_text),
+                  "%s      depth %.2f  (%.1f mm per eye)      convergence %.2f m%s",
+                  modes[std::clamp(s.stereo.load(), 0, BbSettings::StereoCount - 1)], depth,
+                  depth * 32.0f, s.stereo_convergence.load(),
+                  s.stereo_swap ? "      eyes swapped" : "");
+    stereo_notice_start = std::chrono::steady_clock::now();
+    stereo_notice_busy = true;
+}
+
+// Stereo 3D keys, menu open or not (Ctrl+F3, Ctrl+F5..F9): true when `key` is one. Every change
+// is shown (ShowStereoNotice) and saved to bbport.ini at once. A held key repeats at the system
+// rate: the toggles (F3, F9, F10) fire once, the values step at most ~6 times a second.
+bool StereoKey(SDL_Keycode key, bool repeat) {
+    const bool stereo_key = key == SDLK_F3 || key == SDLK_F5 || key == SDLK_F6 || key == SDLK_F7 ||
+                            key == SDLK_F8 || key == SDLK_F9 || key == SDLK_F10;
+    if (!stereo_key) {
+        return false;
+    }
+    static std::chrono::steady_clock::time_point last_step{};
+    const auto now = std::chrono::steady_clock::now();
+    if (repeat && (key == SDLK_F3 || key == SDLK_F9 || key == SDLK_F10 ||
+                   now - last_step < std::chrono::milliseconds(160))) {
+        return true;
+    }
+    last_step = now;
     auto& s = BbSettings::Get();
     switch (key) {
-    case SDLK_F3: // off -> sbs -> alt -> off
+    case SDLK_F3: // off -> sbs -> alt -> geo -> off
         s.stereo = (s.stereo + 1) % BbSettings::StereoCount;
         break;
     case SDLK_F5:
@@ -186,6 +222,7 @@ bool StereoKey(SDL_Keycode key) {
                 BbSettings::StereoName(s.stereo), s.stereo_depth.load(),
                 s.stereo_convergence.load(), s.stereo_popout.load(),
                 s.stereo_swap ? ", eyes swapped" : "");
+    ShowStereoNotice();
     BbSettings::Save();
     return true;
 }
@@ -388,7 +425,8 @@ void Menu() {
 
     ImGui::SeparatorText("3D (stereo)");
     static const char* stereo_modes[] = {"Off", "Side by side from depth (SBS)",
-                                         "Alternate frames (camera hook)"};
+                                         "Alternate frames (camera hook)",
+                                         "One pass, both eyes (multiview)"};
     const int stereo = s.stereo;
     if (ImGui::BeginCombo("3D output", stereo_modes[stereo])) {
         for (int i = 0; i < BbSettings::StereoCount; ++i) {
@@ -400,8 +438,10 @@ void Menu() {
     }
     Hint("Both eyes side by side, made from the game's own depth, for 3D displays and weavers "
          "(SRCapture3D --mode sbs). The UI stays at screen depth. Frame generation is off "
-         "while it is on. Keys: Ctrl+F3 on/off, Ctrl+F5/F6 depth, Ctrl+F7/F8 convergence, "
-         "Ctrl+F9 swap eyes.");
+         "while it is on. One pass: both eyes drawn from the same frame into two layers of "
+         "the scene targets (no time difference between the eyes); the layers exist only when "
+         "geo is set before the start, and the upscaler is off. Keys: Ctrl+F3 mode, "
+         "Ctrl+F5/F6 depth, Ctrl+F7/F8 convergence, Ctrl+F9 swap eyes.");
     ImGui::BeginDisabled(s.stereo == BbSettings::StereoOff);
     Slider("Depth (% of width)", s.stereo_depth, 0.0f, 5.0f);
     float convergence = s.stereo_convergence;
@@ -426,6 +466,13 @@ void Menu() {
          "(SRCapture3D --mode sbs) or a 3D display.");
     if (const char* problem = s.stereo_sr_problem.load()) {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "SR: %s", problem);
+    }
+    if (const char* problem = s.stereo_geo_problem.load()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "One pass: %s", problem);
+    } else if (s.stereo == BbSettings::StereoGeo && !BbSettings::StereoGeoLayers()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
+                           "One pass: chosen after the start, the scene targets have one layer "
+                           "(flat). Save and restart with it.");
     }
     ImGui::EndDisabled();
 
@@ -733,6 +780,42 @@ void TrophyToast() {
     ImGui::PopStyleVar(4);
 }
 
+// The stereo values after a key press (ShowStereoNotice): one line at the top, fading out.
+void StereoNotice() {
+    if (!stereo_notice_busy) {
+        return;
+    }
+    const float t =
+        std::chrono::duration<float>(std::chrono::steady_clock::now() - stereo_notice_start)
+            .count();
+    if (t >= StereoNoticeSeconds) {
+        stereo_notice_busy = false;
+        return;
+    }
+    const float s = base_scale;
+    const float alpha = std::min(1.0f, (StereoNoticeSeconds - t) / 0.4f);
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                   viewport->WorkPos.y + 24.0f * s),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f * s, 10.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f * s);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.06f, 0.08f, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.62f, 0.82f, 0.96f, 1.0f));
+    ImGui::Begin("##stereo_notice", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::SetWindowFontScale(1.25f);
+    ImGui::TextUnformatted(stereo_notice_text);
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(4);
+}
+
 } // namespace
 
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
@@ -826,7 +909,7 @@ bool HandleEvent(const SDL_Event& event) {
             SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
             return true;
         }
-        if (down && (event.key.mod & SDL_KMOD_CTRL) && StereoKey(event.key.key)) {
+        if (down && (event.key.mod & SDL_KMOD_CTRL) && StereoKey(event.key.key, event.key.repeat)) {
             return true;
         }
         if (!is_open) {
@@ -905,7 +988,8 @@ bool HandleEvent(const SDL_Event& event) {
 
 bool Visible() {
     return initialized &&
-           (menu_open || text_entry_active || BbSettings::Get().show_fps || toast_busy);
+           (menu_open || text_entry_active || BbSettings::Get().show_fps || toast_busy ||
+            stereo_notice_busy);
 }
 
 void NotifyTrophy(int grade, std::string game, std::string name, std::vector<unsigned char> png) {
@@ -988,6 +1072,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
         TextEntryBox();
     }
     TrophyToast();
+    StereoNotice();
     ImGui::Render();
 
     const vk::RenderingAttachmentInfo attachment{

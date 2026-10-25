@@ -10,6 +10,7 @@
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/stereo.h"
 
 namespace Shader {
 
@@ -49,6 +50,8 @@ struct ImageSpecialization {
     bool is_storage = false;
     bool is_cube = false;
     bool is_srgb = false;
+    /// bbport: a two-layer scene target, read as a 2D array at the eye's layer (stereo.h).
+    bool stereo_layer = false;
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
     // FIXME any pipeline cache changes needed?
@@ -143,6 +146,7 @@ struct StageSpecialization {
                          }
                          spec.num_conversion = sharp.GetNumberConversion();
                          spec.num_bindings = desc.NumBindings(*info);
+                         spec.stereo_layer = Stereo::ImageSharp(sharp, desc.is_array);
                      });
         ForEachSharp(binding, fmasks, info->fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {

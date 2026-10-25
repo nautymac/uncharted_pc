@@ -44,6 +44,13 @@ public:
     void ComposeAlternate(vk::CommandBuffer cmdbuf, vk::Image frame, vk::ImageView frame_view,
                           u32 width, u32 height, int eye);
 
+    /// Stereo in one pass (BbSettings::StereoGeo, shader_recompiler/stereo.h): `frame`
+    /// (General) holds the left eye and `right` / `right_view` (General, the same size) the
+    /// right one, or null for a flat frame; the frame is rewritten as the pair side by side.
+    /// The eye swap is already in the drawing (the sign of the separation), not applied here.
+    void ComposePair(vk::CommandBuffer cmdbuf, vk::Image frame, vk::ImageView frame_view,
+                     vk::Image right, vk::ImageView right_view, u32 width, u32 height);
+
 private:
     void CreatePipeline();
     void CreatePackPipeline();

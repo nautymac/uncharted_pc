@@ -100,6 +100,8 @@ struct PipelineSelection {
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
     bool motion = false;
+    /// bbport: the pass draws into two-layer scene targets (RefreshGraphicsStages, stereo.h).
+    bool stereo = false;
     DrawIndirectParams draw_indirect_params{};
     /// Compute program state of a worker's dispatch (the GPU thread reads its queue's own).
     const AmdGpu::ComputeProgram* cs{};

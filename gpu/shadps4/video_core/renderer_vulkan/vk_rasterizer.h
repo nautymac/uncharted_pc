@@ -193,6 +193,7 @@ private:
         u32 num_samples = 0;
         std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples{};
         bool motion = false;
+        bool stereo = false; ///< bbport: the key's multiview bit
         bool scene_started = false;
         bool raster_scaling = false;
         u64 upscaler_state = 0;
@@ -259,6 +260,10 @@ private:
     const AmdGpu::Regs& Regs() const;
     AmdGpu::CbDbExtent CbExtent(u32 index) const;
     AmdGpu::CbDbExtent DbExtent() const;
+    /// bbport: stereo 3D in one pass: every target of the pass has two layers (stereo.h).
+    bool TargetsStereo(const GraphicsPipeline* pipeline);
+    /// The settings' stereo parameters into push_data for this draw or dispatch.
+    void SetStereoPushData();
 
     void BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
                      Shader::Backend::Bindings& binding,

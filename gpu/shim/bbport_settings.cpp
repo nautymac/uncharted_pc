@@ -160,6 +160,14 @@ void Load() {
     v.startup_model_lod = v.model_lod;
     v.startup_output_res = v.output_res;
     v.startup_live_resolution = v.live_resolution;
+    v.startup_stereo = v.stereo;
+    if (v.stereo == StereoGeo && v.upscaler != UpscalerOff) {
+        // The geo mode draws both eyes into the two layers of the scene targets; the temporal
+        // upscalers and their reduced scene targets work on one layer.
+        std::printf("Stereo 3D: the geo mode needs the upscaler off; switching it off\n");
+        v.upscaler = UpscalerOff;
+        v.startup_upscaler = v.upscaler;
+    }
 }
 
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
@@ -290,13 +298,23 @@ bool FsrDriverValidated(unsigned driver_id) {
 }
 
 const char* StereoName(int stereo) {
-    static constexpr const char* names[StereoCount] = {"off", "sbs", "alt"};
+    static constexpr const char* names[StereoCount] = {"off", "sbs", "alt", "geo"};
     return names[std::clamp(stereo, 0, StereoCount - 1)];
 }
 
 const char* StereoOutputName(int output) {
     static constexpr const char* names[StereoOutputCount] = {"sbs", "sr"};
     return names[std::clamp(output, 0, StereoOutputCount - 1)];
+}
+
+bool StereoGeoLayers() {
+    static const bool layers = [] {
+        if (const char* env = std::getenv("BB_STEREO_GEO_LAYERS")) {
+            return env[0] == '1';
+        }
+        return Get().startup_stereo == StereoGeo;
+    }();
+    return layers;
 }
 
 } // namespace BbSettings

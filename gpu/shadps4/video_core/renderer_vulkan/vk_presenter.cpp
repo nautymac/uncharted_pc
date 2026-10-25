@@ -188,6 +188,11 @@ Presenter::~Presenter() {
         vmaDestroyImage(instance.GetAllocator(), hudless_frame.image, hudless_frame.allocation);
         device.destroyImageView(hudless_frame.image_view);
     }
+    if (stereo_right_frame.image) {
+        vmaDestroyImage(instance.GetAllocator(), stereo_right_frame.image,
+                        stereo_right_frame.allocation);
+        device.destroyImageView(stereo_right_frame.image_view);
+    }
 }
 
 void Presenter::DestroyGenerated(Frame* frame) {
@@ -566,6 +571,63 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         const int eye = scene.depth ? bbgpu_stereo_frame_eye() : 0;
         stereo->ComposeAlternate(cmdbuf, frame->image, frame->image_view, frame->width,
                                  frame->height, eye);
+        if (!frame_generator->Wanted()) {
+            frame_generator->FinishFrame();
+        }
+    } else if (stereo_on && ::BbSettings::Get().stereo == ::BbSettings::StereoGeo) {
+        // One pass (multiview, shader_recompiler/stereo.h): the display buffer's two layers
+        // hold the eyes. The right eye's layer goes through the same scaling and post passes
+        // into a second frame and the pair is packed side by side. A one-layer buffer (geo not
+        // chosen at start, the upscaler's display) is shown flat on both sides.
+        vk::ImageView right_view{};
+        vk::Image right_image{};
+        if (!upscaled) {
+            auto& image = texture_cache.GetImage(image_id);
+            if (image.stereo_layers > 1) {
+                auto right_info = view_info;
+                right_info.stereo = 1;
+                right_view = *image.FindView(right_info).image_view;
+            }
+        }
+        if (right_view) {
+            if (stereo_right_frame.width != frame->width ||
+                stereo_right_frame.height != frame->height || !stereo_right_frame.image) {
+                RecreateFrame(&stereo_right_frame, frame->width, frame->height);
+            }
+            const vk::ImageMemoryBarrier2 to_target{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .image = stereo_right_frame.image,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            };
+            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_target});
+            const auto scaled = fsr_pass.Render(cmdbuf, right_view, image_size,
+                                                {frame->width, frame->height}, fsr_settings,
+                                                frame->is_hdr);
+            pp_pass.Render(cmdbuf, scaled, image_size, stereo_right_frame, pp_settings);
+            right_image = stereo_right_frame.image;
+        }
+        if (frame_dump) {
+            // Both eyes before the packing (the depth of the shot is not taken in this mode).
+            const vk::MemoryBarrier2 done{.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                                          .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                                          .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                          .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
+            cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &done});
+            DumpRaw(instance, draw_scheduler, cmdbuf, frame->image, vk::ImageLayout::eGeneral,
+                    frame->width, frame->height, "left", frame_dump_index);
+            if (right_image) {
+                DumpRaw(instance, draw_scheduler, cmdbuf, right_image, vk::ImageLayout::eGeneral,
+                        frame->width, frame->height, "right", frame_dump_index);
+            }
+        }
+        stereo->ComposePair(cmdbuf, frame->image, frame->image_view, right_image,
+                            right_view ? stereo_right_frame.image_view : vk::ImageView{},
+                            frame->width, frame->height);
         if (!frame_generator->Wanted()) {
             frame_generator->FinishFrame();
         }

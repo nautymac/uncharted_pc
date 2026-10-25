@@ -36,6 +36,9 @@ struct ImageViewInfo {
     vk::ComponentMapping mapping{};
     u32 min_lod = 0;
     bool is_storage = false;
+    /// bbport: stereo 3D in one pass (Image::stereo_layers): 1 the right eye's layer alone,
+    /// 2 both layers as a 2D array (multiview attachments, shaders reading the eye's layer).
+    u8 stereo = 0;
 
     auto operator<=>(const ImageViewInfo&) const = default;
 };

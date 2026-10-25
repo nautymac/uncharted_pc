@@ -69,7 +69,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     const vk::PushConstantRange push_constants = {
         .stageFlags = vk::ShaderStageFlagBits::eCompute,
         .offset = 0,
-        .size = sizeof(Shader::PushData),
+        .size = Shader::PushConstantSize(profile),
     };
 
     uses_push_descriptors = binding < instance.MaxPushDescriptors();

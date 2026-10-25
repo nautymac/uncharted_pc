@@ -468,7 +468,7 @@ bool Instance::CreateDevice() {
         },
     };
 
-    const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
+    vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
     // bbport: DLSS (optional bridge DLL) needs its own device extensions on NVIDIA GPUs.
@@ -538,6 +538,11 @@ bool Instance::CreateDevice() {
         },
         vk::PhysicalDeviceVulkan11Features{
             .storageBuffer16BitAccess = vk11_features.storageBuffer16BitAccess,
+            // bbport: stereo 3D in one pass (vk_stereo.h, BB_STEREO=geo): both eyes drawn
+            // into the two layers of the scene targets by multiview.
+            .multiview = vk11_features.multiview,
+            .multiviewGeometryShader = vk11_features.multiviewGeometryShader,
+            .multiviewTessellationShader = vk11_features.multiviewTessellationShader,
             .shaderDrawParameters = vk11_features.shaderDrawParameters,
         },
         vk::PhysicalDeviceVulkan12Features{

@@ -59,6 +59,10 @@ struct RenderState {
     u16 height;
     u16 num_layers;
     u16 num_color_attachments;
+    /// bbport: stereo 3D in one pass: 0b11 draws both layers of the attachments (multiview);
+    /// the pipelines of the pass carry the same mask (GraphicsPipelineKey::stereo).
+    u32 view_mask;
+    u32 view_mask_pad;
 
     bool operator==(const RenderState& other) const noexcept {
         return std::memcmp(this, &other, sizeof(RenderState)) == 0;

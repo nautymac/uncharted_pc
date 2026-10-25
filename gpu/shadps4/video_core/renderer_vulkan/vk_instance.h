@@ -289,6 +289,15 @@ public:
         return features.geometryShader;
     }
 
+    /// bbport: stereo 3D in one pass (BB_STEREO=geo): multiview with the stages the games use
+    /// (geometry and tessellation shaders), and push constants large enough for the eye
+    /// parameters (Shader::PushData with its stereo words: 144 bytes; the spec guarantees 128).
+    bool IsMultiviewSupported() const {
+        return vk11_features.multiview && vk11_features.multiviewGeometryShader &&
+               vk11_features.multiviewTessellationShader &&
+               properties.limits.maxPushConstantsSize >= 144;
+    }
+
     /// Returns true when tessellation is supported by the device
     bool IsTessellationSupported() const {
         return features.tessellationShader;
@@ -546,6 +555,7 @@ private:
     vk::PhysicalDeviceVulkan13Properties vk13_props;
     vk::PhysicalDevicePushDescriptorPropertiesKHR push_descriptor_props;
     vk::PhysicalDeviceFeatures features;
+    vk::PhysicalDeviceVulkan11Features vk11_features;
     vk::PhysicalDeviceVulkan12Features vk12_features;
     vk::PhysicalDeviceVulkan13Features vk13_features;
     vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic_state_3_features;

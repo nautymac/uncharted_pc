@@ -159,6 +159,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
                 .extent = {render_state.width, render_state.height},
             },
         .layerCount = render_state.num_layers,
+        .viewMask = render_state.view_mask,
         .colorAttachmentCount = render_state.num_color_attachments,
         .pColorAttachments = color_attachments.data(),
         .pDepthAttachment = db.has_depth ? &depth_attachment : nullptr,

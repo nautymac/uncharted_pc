@@ -962,6 +962,17 @@ void TextureCache::RefreshImage(Image& image) {
         });
     }
 
+    // bbport: a two-layer scene target filled from the CPU (a video frame, a full-screen
+    // picture at the scene size): the right eye's layer gets the same pixels.
+    if (image.stereo_layers > 1) {
+        const size_t count = image_copies.size();
+        for (size_t i = 0; i < count; ++i) {
+            auto copy = image_copies[i];
+            copy.imageSubresource.baseArrayLayer = 1;
+            image_copies.push_back(copy);
+        }
+    }
+
     if (image_copies.empty()) {
         image.flags &= ~ImageFlagBits::Dirty;
         return;

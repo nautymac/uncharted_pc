@@ -44,6 +44,7 @@ struct GraphicsPipelineKey {
     std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
     u32 mrt_mask;
     u32 motion_vectors = 0;
+    u32 stereo = 0; ///< bbport: multiview pass into the two layers of the scene targets (stereo.h)
     struct {
         AmdGpu::DepthBuffer::ZFormat z_format : 2;
         AmdGpu::DepthBuffer::StencilFormat stencil_format : 1;

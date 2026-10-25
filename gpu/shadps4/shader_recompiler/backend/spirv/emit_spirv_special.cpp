@@ -186,6 +186,32 @@ static void EmitFragmentMotion(EmitContext& ctx) {
                     ctx.OpSelect(f32_type, front, dy, zero), valid, depth}));
 }
 
+// bbport: stereo 3D in one pass (stereo.h): the eye's clip-space shift x += sep * (w - conv),
+// the left eye (view 0) with the negative separation (dynamic3d's convention: far points move
+// left in the left eye). Screen-space geometry (w == 1: the HUD, full-screen passes) stays on
+// the screen plane.
+static void EmitStereoOffset(EmitContext& ctx) {
+    const Id f32 = ctx.F32[1];
+    const Id bool_type = ctx.U1[1];
+    const Id position = ctx.OpLoad(ctx.F32[4], ctx.output_position);
+    const Id x = ctx.OpCompositeExtract(f32, position, 0u);
+    const Id w = ctx.OpCompositeExtract(f32, position, 3u);
+    const Id ptr_type = ctx.TypePointer(spv::StorageClass::PushConstant, f32);
+    const Id sep = ctx.OpLoad(f32, ctx.OpAccessChain(ptr_type, ctx.push_data_block,
+                                                     ctx.ConstU32(PushData::StereoIndex),
+                                                     ctx.ConstU32(0u)));
+    const Id conv = ctx.OpLoad(f32, ctx.OpAccessChain(ptr_type, ctx.push_data_block,
+                                                      ctx.ConstU32(PushData::StereoIndex),
+                                                      ctx.ConstU32(1u)));
+    const Id right = ctx.OpINotEqual(bool_type, ctx.StereoLayer(), ctx.u32_zero_value);
+    const Id eye_sep = ctx.OpSelect(f32, right, sep, ctx.OpFNegate(f32, sep));
+    const Id shift = ctx.OpFMul(f32, eye_sep, ctx.OpFSub(f32, w, conv));
+    const Id flat = ctx.OpFOrdLessThan(
+        bool_type, ctx.OpFAbs(f32, ctx.OpFSub(f32, w, ctx.ConstF32(1.0f))), ctx.ConstF32(1e-5f));
+    const Id new_x = ctx.OpFAdd(f32, x, ctx.OpSelect(f32, flat, ctx.f32_zero_value, shift));
+    ctx.OpStore(ctx.output_position, ctx.OpCompositeInsert(ctx.F32[4], new_x, position, 0u));
+}
+
 void EmitEpilogue(EmitContext& ctx) {
     if (Sirit::ValidId(ctx.motion_out_cur)) {
         EmitVertexMotion(ctx);
@@ -199,6 +225,10 @@ void EmitEpilogue(EmitContext& ctx) {
     }
     if (ctx.hw_stage == HwStage::Vertex && ctx.runtime_info.hw.vs.clip_disable) {
         ConvertPositionToClipSpace(ctx);
+    }
+    if (ctx.hw_stage == HwStage::Vertex && ctx.runtime_info.hw.vs.stereo &&
+        !ctx.runtime_info.hw.vs.clip_disable && Sirit::ValidId(ctx.view_index)) {
+        EmitStereoOffset(ctx);
     }
 }
 
@@ -218,6 +248,9 @@ void EmitDiscardCond(EmitContext& ctx, Id condition) {
 }
 
 void EmitEmitVertex(EmitContext& ctx) {
+    if (ctx.runtime_info.hw.gs.stereo && Sirit::ValidId(ctx.view_index)) {
+        EmitStereoOffset(ctx); // bbport: stereo 3D in one pass
+    }
     ctx.OpEmitVertex();
 }
 

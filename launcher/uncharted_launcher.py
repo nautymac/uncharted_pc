@@ -98,6 +98,7 @@ AA_SHARPNESS = [('0', 'Off'), ('0.2', 'Low'), ('0.4', 'Medium'), ('0.7', 'High')
 # Frames generated between two of the game's (BB_FRAME_GEN, BB_FRAME_GEN_MULTIPLIER).
 # Stereo 3D (gpu/shim/bbport_settings.h): how the eyes are made, and where the picture goes.
 STEREO_MODES = [('off', 'Off'), ('alt', 'Alternate frames (the game draws each eye)'),
+                ('geo', 'One pass: both eyes from the same frame (multiview)'),
                 ('sbs', 'From the depth buffer (one picture, reprojected)')]
 STEREO_OUTPUTS = [('sr', 'SR panel (woven in the window)'), ('sbs', 'Side by side in the window')]
 FRAME_GENERATION = [('off', 'Off'), ('fsr3', 'AMD FSR 3 Frame Generation (any GPU)'),
@@ -313,6 +314,108 @@ def set_ini(key, value):
     if not found:
         out.append(f'{key}={value}')
     path.write_text('\n'.join(out) + '\n', encoding='utf-8')
+
+
+def read_ini():
+    """bbport.ini as {key: value}; {} without the file."""
+    try:
+        lines = ini_path().read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return {}
+    values = {}
+    for line in lines:
+        if '=' in line and not line.lstrip().startswith('#'):
+            key, value = line.split('=', 1)
+            values[key.strip()] = value.strip()
+    return values
+
+
+def number_or(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# The 3D page's settings that the game saves to bbport.ini as well (its keys and Insert menu write
+# the file at once): before a start the file gets the page's values, after the game the page takes
+# the file's (adopt_stereo_ini), so a value changed in the game is kept.
+STEREO_INI_KEYS = ('stereo', 'stereo_output', 'stereo_depth', 'stereo_convergence', 'stereo_swap')
+
+
+# The display settings the stereo 3D modes were tested with (D:\PC Port\Uncharted-3D\Uncharted-3D.ps1):
+# the picture must fill the screen so that one eye is exactly half of it (SR weaving, side-by-side
+# capture), the temporal anti-aliasing modes (DLSS, FSR, XeSS, TAA) and frame generation glitch
+# between the eyes, and the one-pass mode draws at the games' own 1080p. Alternate frames need
+# 120 FPS for 60 per eye. Chosen on the 3D page, they are applied to the Display page.
+STEREO_DISPLAY_NAMES = {'fullscreen': 'Fullscreen', 'present_mode': 'Presentation', 'frame_rate': 'Frame rate',
+                        'window_size': 'Window size', 'render_height': 'Render resolution',
+                        'aspect': 'Aspect ratio', 'anti_aliasing': 'Anti-aliasing',
+                        'frame_generation': 'Frame generation'}
+
+
+def stereo_display_defaults(stereo):
+    return {'fullscreen': True, 'present_mode': 'Mailbox', 'frame_rate': '120' if stereo == 'alt' else '60',
+            'window_size': '1920x1080', 'render_height': '1080', 'aspect': '16:9',
+            'anti_aliasing': 'off', 'frame_generation': 'off'}
+
+
+def stereo_display_changes(s):
+    """The display settings that differ from the 3D defaults: (key, current, tested) triples."""
+    stereo = str(s.get('stereo') or 'off')
+    if stereo == 'off':
+        return []
+    changes = []
+    for key, wanted in stereo_display_defaults(stereo).items():
+        current = bool(s.get(key)) if key == 'fullscreen' else str(s.get(key) or '')
+        if current != wanted:
+            changes.append((key, current, wanted))
+    return changes
+
+
+def stereo_ini_values(s):
+    """The 3D page's values as bbport.ini writes them."""
+    return {'stereo': str(s.get('stereo') or 'off'),
+            'stereo_output': str(s.get('stereo_output') or 'sr'),
+            'stereo_depth': f"{number_or(s.get('stereo_depth'), 1.0):.2f}",
+            'stereo_convergence': f"{number_or(s.get('stereo_convergence'), 3.0):.3f}",
+            'stereo_swap': '1' if s.get('stereo_swap') else '0'}
+
+
+def write_stereo_ini(s):
+    for key, value in stereo_ini_values(s).items():
+        set_ini(key, value)
+
+
+def adopt_stereo_ini(s):
+    """The 3D values of bbport.ini into the settings `s`: the keys that changed."""
+    ini = read_ini()
+    changed = []
+    for key in STEREO_INI_KEYS:
+        if key not in ini:
+            continue
+        value, current = ini[key], s.get(key)
+        if key == 'stereo':
+            if value not in [v for v, _t in STEREO_MODES]:
+                continue
+            same = str(current) == value
+        elif key == 'stereo_output':
+            if value not in [v for v, _t in STEREO_OUTPUTS]:
+                continue
+            same = str(current) == value
+        elif key == 'stereo_swap':
+            value = value not in ('0', '', 'false')
+            same = bool(current) == value
+        else:
+            number = number_or(value, None)
+            if number is None:
+                continue
+            same = abs(number_or(current, float('inf')) - number) < 1e-6
+            value = f'{number:g}'
+        if not same:
+            s[key] = value
+            changed.append(key)
+    return changed
 
 
 def game_info(folder):
@@ -542,6 +645,10 @@ def game_environment(s, start=None):
     env['BB_STEREO_DEPTH'] = str(s.get('stereo_depth') or '1.0')
     env['BB_STEREO_CONVERGENCE'] = str(s.get('stereo_convergence') or '3.0')
     env['BB_STEREO_SWAP'] = '1' if s.get('stereo_swap') else '0'
+    try:
+        write_stereo_ini(s)  # the game's own saves (keys, Insert menu) build on these values
+    except OSError:
+        pass
     for key, (_title, _hint, choices) in FIXES.items():
         env.update(choices.get(str(s.get(key) or 'auto'), {}))
     env['BB_BUTTON_PROMPTS'] = str(s.get('button_prompts') or 'auto')
@@ -1367,6 +1474,11 @@ class Launcher:
 
     def build_display(self):
         f = self.page('display', _('Display'), _('How the game window is shown.'))
+        # The settings the 3D modes were tested with (build_3d); shown while a 3D mode is on.
+        self.display_stereo_note = self.tk.Label(self.target(f), text='', bg=CARD, fg=GOLD, font=self.font_ui,
+                                                 wraplength=self.px(680), justify='left')
+        self.display_stereo_note.grid(row=self.next_row(self.target(f)), column=0, columnspan=2,
+                                      sticky='w', pady=(0, 6))
         self.check(f, 'fullscreen', _('Fullscreen'))
         self.row(f, _('Presentation'), self.choice(f, 'present_mode', PRESENT_MODES, 34),
                  _('Mailbox shows each frame as soon as it is ready without tearing; FIFO waits for the display.'))
@@ -1420,11 +1532,23 @@ class Launcher:
 
     def build_3d(self):
         f = self.page('3d', _('3D'), _('Stereoscopic 3D for an SR panel or a side-by-side 3D display.'))
-        self.row(f, _('3D'), self.choice(f, 'stereo', STEREO_MODES, 40),
+        self.row(f, _('3D'), self.choice(f, 'stereo', STEREO_MODES, 40, on_change=self.stereo_mode_changed),
                  _('Alternate frames: the game draws the left and the right eye on alternate frames, with its '
-                   'camera moved (the 120 FPS frame rate gives 60 per eye; set Mailbox presentation). From the '
-                   'depth buffer: one picture reprojected into two eyes, cheaper but with soft edges where one '
-                   'eye sees behind things. Frame generation is off while 3D is on.'))
+                   'camera moved (the 120 FPS frame rate gives 60 per eye; set Mailbox presentation). One pass: '
+                   'both eyes are drawn from the same frame into two layers of the scene targets (no time '
+                   'difference between the eyes; the upscaler is switched off, and the mode must be set here, '
+                   'before the start). From the depth buffer: one picture reprojected into two eyes, cheaper but '
+                   'with soft edges where one eye sees behind things. Frame generation is off while 3D is on.'))
+        # Choosing a 3D mode sets the Display page to the settings it was tested with
+        # (stereo_display_defaults); this warns while the Display page differs from them.
+        holder = self.tk.Frame(self.target(f), bg=CARD)
+        self.stereo_warning = self.tk.Label(holder, text='', bg=CARD, fg=GOLD, font=self.font_ui,
+                                            wraplength=self.px(640), justify='left')
+        self.stereo_warning.pack(side='top', anchor='w')
+        self.stereo_reset = self.pill(holder, _('Use the display settings 3D was tested with'),
+                                      self.stereo_mode_changed, padding=(14, 6))
+        self.stereo_holder = holder
+        holder.grid(row=self.next_row(self.target(f)), column=0, columnspan=2, sticky='w', pady=(8, 0))
         sr = (PORT_DIR / 'bin' / 'ps2sr.dll').is_file() or (PORT_DIR / 'out' / 'ps2sr.dll').is_file()
         self.row(f, _('Output'), self.choice(f, 'stereo_output', STEREO_OUTPUTS, 40),
                  _('SR panel: woven for the panel by the SR SDK, through ps2sr.dll beside the game executable '
@@ -1446,7 +1570,55 @@ class Launcher:
         self.check(f, 'stereo_swap', _('Swap the eyes'),
                    _('When the picture looks inside out. In the game: Ctrl+F9.'))
         self.note(f, _('In the game, Ctrl+F3 switches 3D off and on, Insert opens the settings menu with the same '
-                       'values. These settings are applied when the game starts.'))
+                       'values. These settings are applied when the game starts. A value changed in the game '
+                       '(the keys show it at the top of the picture) is saved at once and comes back to this '
+                       'page when the game closes.'))
+        for key in ('stereo', *stereo_display_defaults('alt')):
+            self.var(key).trace_add('write', lambda *_a: self.update_stereo_warning())
+        self.update_stereo_warning()
+
+    def stereo_mode_changed(self):
+        """A 3D mode was chosen: the Display page gets the settings it was tested with."""
+        stereo = self.var('stereo').get()
+        if stereo != 'off':
+            for key, value in stereo_display_defaults(stereo).items():
+                self.var(key).set(value)
+        self.update_stereo_warning()
+
+    def update_stereo_warning(self):
+        if not hasattr(self, 'stereo_warning') or not hasattr(self, 'display_stereo_note'):
+            return
+        stereo = self.var('stereo').get()
+        if stereo == 'off':
+            self.stereo_holder.grid_remove()
+            self.display_stereo_note.grid_remove()
+            return
+        defaults = stereo_display_defaults(stereo)
+        tested = _('fullscreen, Mailbox, {} FPS, a 1920 × 1080 window, 1080p at 16:9, anti-aliasing off, '
+                   'frame generation off').format(defaults['frame_rate'])
+        settings = {key: self.var(key).get() for key in ('stereo', *defaults)}
+        changes = stereo_display_changes(settings)
+        if changes:
+            def shown(key, value):
+                if key == 'fullscreen':
+                    return _('on') if value else _('off')
+                return str(value)
+            listed = ', '.join(f'{_(STEREO_DISPLAY_NAMES[key])}: {shown(key, current)} (3D: {shown(key, wanted)})'
+                               for key, current, wanted in changes)
+            text = _('Warning: the Display page differs from the settings 3D was tested with. The 3D picture '
+                     'may be wrong or glitch; DLSS, FSR, XeSS, TAA and frame generation break between the '
+                     'eyes. Differences: {}.').format(listed)
+            self.stereo_reset.pack(side='top', anchor='w', pady=(6, 0))
+        else:
+            text = _('3D set the Display page to the settings it was tested with: {}. Changing them there may '
+                     'break the 3D picture (DLSS, FSR, XeSS, TAA and frame generation glitch between the '
+                     'eyes).').format(tested)
+            self.stereo_reset.canvas.pack_forget()
+        self.stereo_warning.configure(text=text)
+        self.stereo_holder.grid()
+        self.display_stereo_note.configure(
+            text=_('3D is on: it was tested with {}. Other values may break the 3D picture.').format(tested))
+        self.display_stereo_note.grid()
 
     def build_controls(self):
         f = self.page('controls', _('Controls'),
@@ -2028,6 +2200,9 @@ class Launcher:
             self.messagebox.showerror(NAME, _('This game is not in the chosen folder.'))
             return
         self.set_log('')
+        for key, current, wanted in stereo_display_changes(self.app):
+            self.append(_('3D: the Display setting "{}" is {}; 3D was tested with {}. The 3D picture may be '
+                          'wrong.').format(_(STEREO_DISPLAY_NAMES[key]), current, wanted) + '\n')
         try:
             env = game_environment(self.app)
         except OSError as error:
@@ -2083,6 +2258,7 @@ class Launcher:
                     self.process = None
                     if self.job:
                         self.job.close()
+                    self.adopt_stereo()
                     self.play_button.configure(state='normal')
                     self.stop_button.configure(state='disabled')
                     self.refresh()
@@ -2105,6 +2281,18 @@ class Launcher:
         except queue.Empty:
             pass
         self.root.after(100, self.drain_output)
+
+    def adopt_stereo(self):
+        """3D values changed in the game (keys, Insert menu) come back to the 3D page and are saved."""
+        changed = adopt_stereo_ini(self.app)
+        if not changed:
+            return
+        for key in changed:
+            value = self.app[key]
+            self.var(key).set(bool(value) if isinstance(APP_DEFAULTS[key], bool) else str(value))
+        self.collect()
+        self.append(_('3D values from the game: ') +
+                    ', '.join(f"{key} = {self.app[key]}" for key in changed) + '\n')
 
     def stop(self):
         if not self.process:
@@ -2609,7 +2797,14 @@ def play_without_window(settings):
                 sys.stdout.write(text)
             except (OSError, ValueError):
                 pass
-        return process.wait()
+        code = process.wait()
+        if adopt_stereo_ini(settings):
+            try:
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                CONFIG_FILE.write_text(json.dumps(settings, indent=2) + '\n', encoding='utf-8')
+            except OSError:
+                pass
+        return code
 
 
 def main():

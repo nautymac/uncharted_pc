@@ -124,7 +124,9 @@ bool FrameGenerator::Wanted() const {
 }
 
 bool FrameGenerator::Capturing() const {
-    return Wanted() || BbSettings::Get().stereo != BbSettings::StereoOff;
+    // The geo stereo mode draws both eyes itself: no depth or picture to take.
+    const int stereo = BbSettings::Get().stereo;
+    return Wanted() || (stereo != BbSettings::StereoOff && stereo != BbSettings::StereoGeo);
 }
 
 FrameGenerator::StereoScene FrameGenerator::Scene() const {

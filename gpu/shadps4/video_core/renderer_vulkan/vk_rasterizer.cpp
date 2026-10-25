@@ -7,6 +7,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <unordered_set>
 #include "core/libraries/videoout/driver.h"
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
@@ -26,7 +27,9 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+#include "bbport_settings.h"
 #include "bbport_threads.h"
+#include "shader_recompiler/stereo.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -34,6 +37,8 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan {
+
+static bool StereoDispatch(const Shader::Info& cs); // bbport: stereo 3D in one pass
 
 // bbport diagnosis: BB_CONST_CHECK=<shader hash>: the constants of that shader's draws as they
 // were packed for recording (user data, the flattened resource table read through it, constant
@@ -177,6 +182,21 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+    // bbport: stereo 3D in one pass (stereo.h): the scene targets get two layers from the start
+    // when the geo mode is chosen and the device draws multiview.
+    {
+        auto& settings = BbSettings::Get();
+        const bool wanted = BbSettings::StereoGeoLayers();
+        Shader::Stereo::geo_layers = wanted && instance.IsMultiviewSupported();
+        if (wanted && !Shader::Stereo::geo_layers) {
+            settings.stereo_geo_problem =
+                "needs multiview with geometry and tessellation shaders and 144 bytes of push "
+                "constants, which this GPU lacks: drawing flat";
+            std::printf("Stereo 3D: geo %s\n", settings.stereo_geo_problem.load());
+        } else if (Shader::Stereo::geo_layers) {
+            std::printf("Stereo 3D: geo mode, scene targets with two layers (multiview)\n");
+        }
+    }
     // Before the rasterizer is bound: Liverpool enqueues buffers only once it sees it.
     draw_prep = std::make_unique<DrawPreparation>(pipeline_cache);
     scene_targets = std::make_unique<SceneTargets>(instance, scheduler, runtime, texture_cache);
@@ -1470,6 +1490,21 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     motion_geometry = 0;
 
     PrepareRenderState(pipeline);
+    // bbport: stereo 3D in one pass: the key predicted two-layer targets from the registers; an
+    // image found at another size has one layer, which a multiview pass cannot bind.
+    if (pipeline->GetGraphicsKey().stereo && !TargetsStereo(pipeline)) {
+        static std::atomic<u32> skipped{0};
+        if (skipped.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::printf("Stereo 3D: stereo pass with a one-layer target (vs %08x, ps %08x), draw "
+                        "skipped\n",
+                        u32(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash),
+                        pipeline->GetGraphicsKey().mrt_mask
+                            ? u32(pipeline->GetStage(Shader::SwStage::Fragment).pgm_hash)
+                            : 0u);
+        }
+        ResetBindings(false);
+        return;
+    }
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
@@ -1718,6 +1753,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             });
         }
     }
+    SetStereoPushData();
     pipeline->BindResources(set_writes, push_data);
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
@@ -1851,6 +1887,21 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     motion_draw = false;
     motion_geometry = 0;
     PrepareRenderState(pipeline);
+    // bbport: stereo 3D in one pass: the key predicted two-layer targets from the registers; an
+    // image found at another size has one layer, which a multiview pass cannot bind.
+    if (pipeline->GetGraphicsKey().stereo && !TargetsStereo(pipeline)) {
+        static std::atomic<u32> skipped{0};
+        if (skipped.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::printf("Stereo 3D: stereo pass with a one-layer target (vs %08x, ps %08x), draw "
+                        "skipped\n",
+                        u32(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash),
+                        pipeline->GetGraphicsKey().mrt_mask
+                            ? u32(pipeline->GetStage(Shader::SwStage::Fragment).pgm_hash)
+                            : 0u);
+        }
+        ResetBindings(false);
+        return;
+    }
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
@@ -1887,6 +1938,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     push_data.xoffset *= target_scale[0];
     push_data.yscale *= target_scale[1];
     push_data.yoffset *= target_scale[1];
+    SetStereoPushData();
     pipeline->BindResources(set_writes, push_data);
     draw_jitter = {};
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth()) {
@@ -2184,6 +2236,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     scheduler.EndRendering();
     mark();
+    SetStereoPushData();
     pipeline->BindResources(set_writes, push_data);
 
     const vk::Pipeline handle = pipeline->Handle();
@@ -2199,6 +2252,8 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         return env ? std::atoi(env) : 0;
     }();
     const void* checkpoint = NoteCheckpoint("dispatch", cs.pgm_hash, 0, dim_x, dim_y, dim_z, 0);
+    const bool stereo_dispatch = StereoDispatch(cs);
+    const vk::PipelineLayout layout = pipeline->GetLayout();
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         const vk::MemoryBarrier2 barrier = {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -2217,6 +2272,18 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
             cmdbuf.setCheckpointNV(checkpoint);
         }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        if (stereo_dispatch) {
+            // bbport: the right eye's layer of the stereo images first: the same dispatch with
+            // the eye in the push constants (its images are arrays, layer = stereo_eye). The
+            // left eye runs last, so that a buffer both eyes write keeps the left eye's result.
+            const u32 right = 1, left = 0;
+            cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute,
+                                 offsetof(Shader::PushData, stereo_eye), sizeof(right), &right);
+            cmdbuf.dispatch(dim_x, dim_y, dim_z);
+            cmdbuf.pipelineBarrier2(dependency);
+            cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute,
+                                 offsetof(Shader::PushData, stereo_eye), sizeof(left), &left);
+        }
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
         if (full_barrier >= 1) {
             cmdbuf.pipelineBarrier2(dependency);
@@ -2264,6 +2331,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     }
 
     scheduler.EndRendering();
+    SetStereoPushData();
     pipeline->BindResources(set_writes, push_data);
 
     const vk::Pipeline handle = pipeline->Handle();
@@ -2272,11 +2340,29 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     const void* checkpoint =
         NoteCheckpoint("indirect dispatch", pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,
                        0, size, 0, 0, address + offset);
+    const bool stereo_dispatch = StereoDispatch(pipeline->GetStage(Shader::SwStage::Compute));
+    const vk::PipelineLayout layout = pipeline->GetLayout();
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         if (checkpoint) {
             cmdbuf.setCheckpointNV(checkpoint);
         }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        if (stereo_dispatch) {
+            // bbport: the right eye's layer first, the left eye last (see DispatchRecord).
+            const vk::MemoryBarrier2 barrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+            };
+            const u32 right = 1, left = 0;
+            cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute,
+                                 offsetof(Shader::PushData, stereo_eye), sizeof(right), &right);
+            cmdbuf.dispatchIndirect(args, args_offset);
+            cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+            cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute,
+                                 offsetof(Shader::PushData, stereo_eye), sizeof(left), &left);
+        }
         cmdbuf.dispatchIndirect(args, args_offset);
     });
     DebugState.IncDispatch();
@@ -3208,6 +3294,9 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
     if (entry.flags != flags || entry.sharp != key ||
         BbToggle::Disabled(BbToggle::ImageDescCache)) {
         entry.desc = VideoCore::TextureCache::ImageDesc{sharp, res};
+        // bbport: stereo 3D in one pass: the shader is compiled to read this T# as a 2D array at
+        // the eye's layer (stereo.h), so its view spans both layers (one when the image has one).
+        entry.desc.view_info.stereo = Shader::Stereo::ImageSharp(sharp, res.is_array) ? 2 : 0;
         entry.sharp = key;
         entry.flags = flags;
         entry.found_generation = ~0ULL;
@@ -3634,6 +3723,7 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
     sig.mrt_mask = key.mrt_mask;
     sig.num_samples = key.num_samples;
     sig.motion = key.motion_vectors;
+    sig.stereo = key.stereo != 0;
     sig.scene_started = scene_started;
     sig.raster_scaling = upscaler->RasterScaling();
     sig.upscaler_state = upscaler->RedirectState();
@@ -3730,6 +3820,51 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
     return true;
 }
 
+bool Rasterizer::TargetsStereo(const GraphicsPipeline* pipeline) {
+    const u32 num_color = std::bit_width(pipeline->GetGraphicsKey().mrt_mask);
+    u32 targets = 0;
+    for (u32 cb = 0; cb < num_color && cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        if (const auto id = cb_descs[cb].first) {
+            if (texture_cache.GetImage(id).stereo_layers < 2) {
+                return false;
+            }
+            ++targets;
+        }
+    }
+    if (const auto id = db_desc.first) {
+        if (texture_cache.GetImage(id).stereo_layers < 2) {
+            return false;
+        }
+        ++targets;
+    }
+    return targets > 0;
+}
+
+void Rasterizer::SetStereoPushData() {
+    // stereo.h: x += sep * (w - conv); depth 1.0 (% of the width) is a shift of 0.01 in NDC
+    // per eye at infinity. The swap changes the sign: layer 0 (shown left) then gets the
+    // right eye's picture.
+    const auto& s = BbSettings::Get();
+    const float sign = s.stereo_swap ? -1.0f : 1.0f;
+    push_data.stereo = {sign * s.stereo_depth.load() / 100.0f, s.stereo_convergence.load()};
+    push_data.stereo_eye = 0;
+    push_data.stereo_pad = 0;
+}
+
+// bbport: stereo 3D in one pass: a dispatch reading or writing a two-layer scene target runs
+// once per eye (stereo.h; the shader's images are arrays, layer = push constant stereo_eye).
+static bool StereoDispatch(const Shader::Info& cs) {
+    if (!Shader::Stereo::geo_layers) {
+        return false;
+    }
+    for (const auto& image : cs.images) {
+        if (Shader::Stereo::ImageSharp(image.GetSharp(cs), image.is_array)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     // bbport: RenderStateMemo (see BeginMemo).
     const bool memo_on = !BbToggle::Disabled(BbToggle::RenderStateMemo) && !FrameCapture::Active();
@@ -3804,7 +3939,8 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         scene_targets->EligibleScene(texture_cache.GetImage(db_desc.first))) scene_started = true;
     // A proxy attachment cannot represent MSAA or a feedback loop that reads the
     // same image through the guest's native descriptor during this draw.
-    bool reduced = scene_started && upscaler->RasterScaling() && key.num_samples == 1;
+    bool reduced = scene_started && upscaler->RasterScaling() && key.num_samples == 1 &&
+                   !key.stereo;
     // BB_SCENE_DEBUG=<file>: once the file exists, why the passes of one frame keep the
     // native size (see NoteFrameStart).
     const bool debug_pass = scene_debug_frame && scene_started;
@@ -3869,6 +4005,41 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
     state.num_color_attachments = std::bit_width(key.mrt_mask);
+    // bbport: stereo 3D in one pass: both layers of the targets, drawn by multiview.
+    const bool stereo = key.stereo != 0;
+    state.view_mask = stereo ? 0b11u : 0u;
+    state.view_mask_pad = 0;
+    // BB_STEREO_LOG=1: the passes of the geo mode, once per pipeline (first 64), with their
+    // targets' sizes and host layers.
+    static const bool stereo_log = [] {
+        const char* env = std::getenv("BB_STEREO_LOG");
+        return env && env[0] == '1';
+    }();
+    if (stereo_log && Shader::Stereo::geo_layers) {
+        static std::unordered_set<u64> logged;
+        const u64 pass_key = key.stage_hashes[u32(Shader::SwStage::Vertex)] ^
+                             (key.stage_hashes[u32(Shader::SwStage::Fragment)] << 1) ^
+                             (u64(key.stereo) << 63);
+        if (logged.size() < 64 && logged.insert(pass_key).second) {
+            std::string targets;
+            for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+                if (const auto id = cb_descs[cb].first) {
+                    const auto& image = texture_cache.GetImage(id);
+                    targets += fmt::format(" cb{} {}x{} L{}", cb, image.info.size.width,
+                                           image.info.size.height, image.stereo_layers);
+                }
+            }
+            if (const auto id = db_desc.first) {
+                const auto& image = texture_cache.GetImage(id);
+                targets += fmt::format(" db {}x{} L{}", image.info.size.width,
+                                       image.info.size.height, image.stereo_layers);
+            }
+            std::printf("Stereo 3D: pass vs %08x ps %08x %s:%s\n",
+                        u32(key.stage_hashes[u32(Shader::SwStage::Vertex)]),
+                        u32(key.stage_hashes[u32(Shader::SwStage::Fragment)]),
+                        stereo ? "STEREO" : "mono", targets.c_str());
+        }
+    }
     for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         if (!image_id) {
@@ -3883,7 +4054,10 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         }
         texture_cache.UpdateImage(image_id);
         runtime.SetBackingSamples(image, key.color_samples[cb]);
-        const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
+        // bbport: stereo: the attachment view spans both layers (ImageViewInfo::stereo 2).
+        auto stereo_desc = desc;
+        stereo_desc.view_info.stereo = stereo ? 2 : 0;
+        const auto& image_view = texture_cache.FindRenderTarget(image_id, stereo_desc);
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
 
@@ -3932,7 +4106,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             attachment.image_layout = target.layout;
         }
         image->usage.render_target = 1u;
-        if (cb == 0 && upscaler->Enabled()) {
+        if (cb == 0 && upscaler->Enabled() && !stereo) {
             color_redirected = upscaler->RedirectColor(image_id, desc.view_info, redirect);
             if (color_redirected) {
                 guest_extent = {image->info.size.width, image->info.size.height};
@@ -3949,7 +4123,9 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     if (auto image_id = db_desc.first; image_id) {
         auto& desc = db_desc.second;
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
-        const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
+        auto stereo_desc = desc;
+        stereo_desc.view_info.stereo = stereo ? 2 : 0;
+        const auto& image_view = texture_cache.FindDepthTarget(image_id, stereo_desc);
         auto& image = texture_cache.GetImage(image_id);
 
         const auto slice = image_view.info.range.base.layer;
@@ -4006,7 +4182,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             attachment.image_layout = target.layout;
         }
         image.usage.depth_target = true;
-        if (upscaler->Enabled()) {
+        if (upscaler->Enabled() && !stereo) {
             VulkanUpscalerTarget depth_redirect;
             depth_redirected = upscaler->RedirectDepth(image_id, depth_redirect);
             if (depth_redirected) {

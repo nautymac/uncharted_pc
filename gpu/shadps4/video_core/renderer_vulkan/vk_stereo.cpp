@@ -427,4 +427,98 @@ void Stereo::ComposeAlternate(vk::CommandBuffer cmdbuf, vk::Image frame, vk::Ima
     cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &done});
 }
 
+void Stereo::ComposePair(vk::CommandBuffer cmdbuf, vk::Image frame, vk::ImageView frame_view,
+                         vk::Image right, vk::ImageView right_view, u32 width, u32 height) {
+    if (width < 2 || !height) {
+        return;
+    }
+    CreatePackPipeline();
+    EnsureOutput(width, height);
+    const auto barrier = [](vk::Image image, vk::ImageLayout from, vk::ImageLayout to,
+                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+                            vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+        return vk::ImageMemoryBarrier2{
+            .srcStageMask = src_stage,
+            .srcAccessMask = src_access,
+            .dstStageMask = dst_stage,
+            .dstAccessMask = dst_access,
+            .oldLayout = from,
+            .newLayout = to,
+            .image = image,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+    };
+    const vk::AccessFlags2 written = vk::AccessFlagBits2::eColorAttachmentWrite |
+                                     vk::AccessFlagBits2::eShaderWrite |
+                                     vk::AccessFlagBits2::eTransferWrite;
+    const bool pair = right && right_view;
+    const std::array<vk::ImageMemoryBarrier2, 3> before{
+        barrier(vk::Image(output), vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eTransferRead,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite),
+        barrier(frame, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral,
+                vk::PipelineStageFlagBits2::eAllCommands, written,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead),
+        barrier(right, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral,
+                vk::PipelineStageFlagBits2::eAllCommands, written,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead),
+    };
+    cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = pair ? 3u : 2u,
+                             .pImageMemoryBarriers = before.data()});
+    const vk::DescriptorImageInfo left_info{.sampler = *sampler,
+                                            .imageView = frame_view,
+                                            .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo right_info{.sampler = *sampler,
+                                             .imageView = pair ? right_view : frame_view,
+                                             .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo output_info{.imageView = *output_view,
+                                              .imageLayout = vk::ImageLayout::eGeneral};
+    const std::array<vk::WriteDescriptorSet, 3> writes{{
+        {.dstBinding = 0, .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &left_info},
+        {.dstBinding = 1, .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &right_info},
+        {.dstBinding = 2, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageImage,
+         .pImageInfo = &output_info},
+    }};
+    const u32 constants[3] = {width, height, 0u};
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *pack_pipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pack_pipeline_layout, 0, writes);
+    cmdbuf.pushConstants(*pack_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                         sizeof(constants), constants);
+    cmdbuf.dispatch((width + 7) / 8, (height + 7) / 8, 1);
+
+    const std::array<vk::ImageMemoryBarrier2, 2> to_copy{
+        barrier(vk::Image(output), vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferSrcOptimal,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead),
+        barrier(frame, vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferDstOptimal,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite),
+    };
+    cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = u32(to_copy.size()),
+                             .pImageMemoryBarriers = to_copy.data()});
+    cmdbuf.copyImage(vk::Image(output), vk::ImageLayout::eTransferSrcOptimal, frame,
+                     vk::ImageLayout::eTransferDstOptimal,
+                     vk::ImageCopy{.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                                   .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                                   .extent = {width, height, 1}});
+    const auto done = barrier(frame, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eGeneral,
+                              vk::PipelineStageFlagBits2::eTransfer,
+                              vk::AccessFlagBits2::eTransferWrite,
+                              vk::PipelineStageFlagBits2::eAllCommands,
+                              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead);
+    cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &done});
+
+    static bool reported_pair = false, reported_flat = false;
+    if (pair && !reported_pair) {
+        reported_pair = true;
+        std::printf("Stereo 3D: one pass (multiview), the two layers of the display buffer side "
+                    "by side, %ux%u per eye\n", width, height);
+    } else if (!pair && !reported_flat) {
+        reported_flat = true;
+        std::printf("Stereo 3D: a display buffer with one layer, shown flat\n");
+    }
+}
+
 } // namespace Vulkan

@@ -252,6 +252,13 @@ public:
     Id vertex_index{};
     Id instance_id{};
     Id push_data_block{};
+    // bbport: stereo 3D in one pass (stereo.h): the eye being drawn (BuiltIn ViewIndex); set
+    // for the vertex stages that move Position and for stages reading a two-layer target.
+    Id view_index{};
+    [[nodiscard]] bool NeedsViewIndex() const;
+    /// The layer of a two-layer scene target for this invocation (U32): ViewIndex, or the
+    /// dispatch's eye from the push constants in compute.
+    [[nodiscard]] Id StereoLayer();
     // bbport: object motion vectors (runtime_info.h, MotionVectors).
     Id motion_out_cur{};
     Id motion_out_prev{};
@@ -319,8 +326,13 @@ public:
         AmdGpu::ImageType view_type;
         bool is_integer = false;
         bool is_storage = false;
+        /// bbport: a two-layer scene target: the image type is arrayed, layer = eye (stereo.h).
+        bool stereo_layer = false;
         MipStorageFallbackMode mip_fallback_mode{};
     };
+    /// bbport: `coords` (two components) with the eye's layer appended when `texture` is a
+    /// two-layer scene target; `floating` for sampling coordinates, else integer texels.
+    [[nodiscard]] Id StereoCoords(const TextureDefinition& texture, Id coords, bool floating);
 
     enum class PointerType : u32 {
         U8,

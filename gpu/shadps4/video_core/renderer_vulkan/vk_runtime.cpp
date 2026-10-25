@@ -346,8 +346,10 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
                 region.dstSubresource.layerCount = 1;
                 region.extent = vk::Extent3D(mip_w, mip_h, mip_d);
             } else {
-                // Array images
-                const u32 copy_layers = std::min(src_layers, dst_layers);
+                // Array images (bbport: both layers of two stereo scene targets)
+                const u32 copy_layers = src->stereo_layers > 1 && dst->stereo_layers > 1
+                                            ? 2u
+                                            : std::min(src_layers, dst_layers);
                 region.srcSubresource.layerCount = copy_layers;
                 region.dstSubresource.layerCount = copy_layers;
                 region.extent = vk::Extent3D(mip_w, mip_h, 1);
@@ -463,19 +465,21 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
 
     const auto [src_layers, dst_layers] =
         SanitizeCopyLayers(src->info, dst->info, src->info.size.depth);
+    // bbport: both layers of two stereo scene targets.
+    const bool stereo = src->stereo_layers > 1 && dst->stereo_layers > 1 && slice == 0;
 
     const vk::ImageCopy image_copy{
         .srcSubresource{
             .aspectMask = src->aspect_mask,
             .mipLevel = 0,
             .baseArrayLayer = 0,
-            .layerCount = src_layers,
+            .layerCount = stereo ? 2u : src_layers,
         },
         .dstSubresource{
             .aspectMask = src->aspect_mask,
             .mipLevel = mip,
             .baseArrayLayer = slice,
-            .layerCount = dst_layers,
+            .layerCount = stereo ? 2u : dst_layers,
         },
         .extent = {src->info.size.width, src->info.size.height, src->info.size.depth},
     };
@@ -552,20 +556,22 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
     }
 
     const auto aspect_mask = src->aspect_mask & dst->aspect_mask;
+    // bbport: both layers of two stereo scene targets.
+    const bool stereo = src->stereo_layers > 1 && dst->stereo_layers > 1;
 
     const vk::ImageCopy region = {
         .srcSubresource{
             .aspectMask = aspect_mask,
             .mipLevel = 0,
-            .baseArrayLayer = sub_range.base.layer,
-            .layerCount = sub_range.extent.layers,
+            .baseArrayLayer = stereo ? 0u : sub_range.base.layer,
+            .layerCount = stereo ? 2u : sub_range.extent.layers,
         },
         .srcOffset = {0, 0, 0},
         .dstSubresource{
             .aspectMask = aspect_mask,
             .mipLevel = 0,
-            .baseArrayLayer = sub_range.base.layer,
-            .layerCount = sub_range.extent.layers,
+            .baseArrayLayer = stereo ? 0u : sub_range.base.layer,
+            .layerCount = stereo ? 2u : sub_range.extent.layers,
         },
         .dstOffset = {0, 0, 0},
         .extent = {dst->info.size.width, dst->info.size.height, 1},
@@ -667,8 +673,9 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .baseMipLevel = range.base.level,
         .levelCount = range.extent.levels,
-        .baseArrayLayer = range.base.layer,
-        .layerCount = range.extent.layers,
+        // bbport: both layers of a stereo scene target.
+        .baseArrayLayer = dst->stereo_layers > 1 ? 0u : range.base.layer,
+        .layerCount = dst->stereo_layers > 1 ? 2u : range.extent.layers,
     };
     scheduler.Record([image = dst->GetImage(), color = clear_value.color,
                       vk_range](vk::CommandBuffer cmdbuf) {
@@ -738,7 +745,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
                 .baseMipLevel = 0,
                 .levelCount = 1,
                 .baseArrayLayer = 0,
-                .layerCount = image->info.resources.layers,
+                .layerCount = VK_REMAINING_ARRAY_LAYERS,
             },
         });
         FlushBarriers();

@@ -135,6 +135,7 @@ Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Bias, bias);
     operands.AddOffset(ctx, offset);
+    coords = ctx.StereoCoords(texture, coords, true);
     const Id sample = ctx.OpImageSampleImplicitLod(result_type, sampled_image, coords,
                                                    operands.mask, operands.operands);
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
@@ -153,6 +154,7 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Lod, lod);
     operands.AddOffset(ctx, offset);
+    coords = ctx.StereoCoords(texture, coords, true);
     const Id sample = ctx.OpImageSampleExplicitLod(result_type, sampled_image, coords,
                                                    operands.mask, operands.operands);
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
@@ -171,6 +173,7 @@ Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, 
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Bias, bias);
     operands.AddOffset(ctx, offset);
+    coords = ctx.StereoCoords(texture, coords, true);
     const Id sample = ctx.OpImageSampleDrefImplicitLod(result_type, sampled_image, coords, dref,
                                                        operands.mask, operands.operands);
     const Id sample_typed = texture.is_integer ? ctx.OpBitcast(ctx.F32[1], sample) : sample;
@@ -191,6 +194,7 @@ Id EmitImageSampleDrefExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, 
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Lod, lod);
     operands.AddOffset(ctx, offset);
+    coords = ctx.StereoCoords(texture, coords, true);
     const Id sample = ctx.OpImageSampleDrefExplicitLod(result_type, sampled_image, coords, dref,
                                                        operands.mask, operands.operands);
     const Id sample_typed = texture.is_integer ? ctx.OpBitcast(ctx.F32[1], sample) : sample;
@@ -208,6 +212,7 @@ Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
     const u32 comp = inst->Flags<IR::TextureInstInfo>().gather_comp.Value();
     ImageOperands operands;
     operands.AddOffset(ctx, offset, true);
+    coords = ctx.StereoCoords(texture, coords, true);
     const Id texels = ctx.OpImageGather(result_type, sampled_image, coords, ctx.ConstU32(comp),
                                         operands.mask, operands.operands);
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], texels) : texels;
@@ -222,6 +227,7 @@ Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
     const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
     ImageOperands operands;
     operands.AddOffset(ctx, offset, true);
+    coords = ctx.StereoCoords(texture, coords, true);
     const Id texels = ctx.OpImageDrefGather(result_type, sampled_image, coords, dref, operands.mask,
                                             operands.operands);
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], texels) : texels;
@@ -238,6 +244,12 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
         return uses_lod ? ctx.OpImageQuerySizeLod(type, image, lod)
                         : ctx.OpImageQuerySize(type, image);
     }};
+    if (texture.stereo_layer) {
+        // bbport: the array of the two eyes: its size without the layer count.
+        const Id size = query(ctx.U32[3]);
+        return ctx.OpCompositeConstruct(ctx.U32[4], ctx.OpCompositeExtract(ctx.U32[1], size, 0u),
+                                        ctx.OpCompositeExtract(ctx.U32[1], size, 1u), zero, mips());
+    }
     switch (texture.view_type) {
     case AmdGpu::ImageType::Color1D:
         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[1]), zero, zero, mips());
@@ -272,6 +284,7 @@ Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id
     ImageOperands operands;
     operands.AddDerivatives(ctx, derivatives_dx, derivatives_dy);
     operands.AddOffset(ctx, offset);
+    coords = ctx.StereoCoords(texture, coords, true);
     const Id sample = ctx.OpImageSampleExplicitLod(result_type, sampled_image, coords,
                                                    operands.mask, operands.operands);
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
@@ -282,6 +295,7 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod
     const Id color_type = texture.data_types->Get(4);
     ImageOperands operands;
     Id texel;
+    coords = ctx.StereoCoords(texture, coords, false);
     if (!texture.is_storage) {
         const Id image = ctx.OpLoad(texture.image_type, texture.id);
         if (texture.view_type == AmdGpu::ImageType::Color2DMsaa) {
@@ -330,6 +344,7 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id 
     const Id color_type = texture.data_types->Get(4);
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Sample, ms);
+    coords = ctx.StereoCoords(texture, coords, false);
     if (ctx.profile.supports_image_load_store_lod) {
         operands.Add(spv::ImageOperandsMask::Lod, lod);
     } else if (Sirit::ValidId(lod)) {

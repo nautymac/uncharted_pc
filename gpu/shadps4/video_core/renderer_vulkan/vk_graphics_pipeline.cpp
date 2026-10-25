@@ -44,7 +44,7 @@ GraphicsPipeline::GraphicsPipeline(
     const vk::PushConstantRange push_constants = {
         .stageFlags = AllGraphicsStageBits,
         .offset = 0,
-        .size = sizeof(Shader::PushData),
+        .size = Shader::PushConstantSize(profile),
     };
 
     const vk::DescriptorSetLayout set_layout = *desc_layout;
@@ -281,6 +281,7 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::PipelineRenderingCreateInfo pipeline_rendering_ci = {
         .pNext = instance.IsMixedDepthSamplesSupported() ? &mixed_samples : nullptr,
+        .viewMask = key.stereo ? 0b11u : 0u, // bbport: both eyes (RenderState::view_mask)
         .colorAttachmentCount = key.num_color_attachments,
         .pColorAttachmentFormats = color_formats.data(),
         .depthAttachmentFormat = key.z_format != AmdGpu::DepthBuffer::ZFormat::Invalid

@@ -5,6 +5,7 @@
 
 #include "common/types.h"
 #include "shader_recompiler/ir/type.h"
+#include "shader_recompiler/profile.h"
 #include "video_core/amdgpu/resource.h"
 
 #include <boost/container/static_vector.hpp>
@@ -218,6 +219,8 @@ struct PushData {
     static constexpr u32 BufOffsetIndex = UdRegsIndex + NUM_USER_DATA_REGS / 4;
     static constexpr u32 MotionParamIndex = BufOffsetIndex + NUM_BUFFERS / 16 + 1;
     static constexpr u32 SceneSizeIndex = MotionParamIndex + 1;
+    static constexpr u32 StereoIndex = SceneSizeIndex + 1;   ///< bbport: F32x2 (stereo.h)
+    static constexpr u32 StereoEyeIndex = StereoIndex + 1;   ///< bbport: U32, a dispatch's eye
 
     float xoffset;
     float yoffset;
@@ -227,13 +230,23 @@ struct PushData {
     std::array<u8, NUM_BUFFERS> buf_offsets;
     u32 motion_param; ///< bbport: object motion parameter index (0: off)
     u32 scene_size; ///< reduced width | height << 16; zero means native pixel coordinates
+    /// bbport: stereo 3D in one pass (stereo.h): the right eye's clip-space x shift per unit
+    /// of (w - convergence) (the left eye gets its negative) and the convergence distance in
+    /// clip w. Pushed only on devices allowing 144 bytes (Profile::stereo_push).
+    std::array<float, 2> stereo;
+    u32 stereo_eye; ///< compute: the layer of the stereo images read and written (0 left)
+    u32 stereo_pad;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());
         buf_offsets[binding] = offset;
     }
 };
-static_assert(sizeof(PushData) <= 128,
-              "PushData size is greater than minimum size guaranteed by Vulkan spec");
+static_assert(sizeof(PushData) == 144, "PushData: 128 bytes (the spec's minimum) + stereo");
+
+/// bbport: the push constant range: the first 128 bytes without the stereo words.
+inline u32 PushConstantSize(const Profile& profile) {
+    return profile.stereo_push ? static_cast<u32>(sizeof(PushData)) : 128u;
+}
 
 } // namespace Shader

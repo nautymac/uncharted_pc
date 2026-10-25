@@ -118,6 +118,8 @@ struct HwVertexRuntimeInfo {
     u32 user_clip_plane_mask{};
     /// bbport: object motion vectors (G-buffer draws), see MotionVectors below.
     bool motion_vectors{};
+    /// bbport: stereo 3D in one pass: Position moved by the eye (stereo.h).
+    bool stereo{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;
 };
@@ -172,13 +174,15 @@ struct HwGeometryRuntimeInfo {
     AmdGpu::GsScenario mode;
     std::span<const u32> vs_copy;
     u64 vs_copy_hash;
+    /// bbport: stereo 3D in one pass: each emitted Position moved by the eye (stereo.h).
+    bool stereo{};
 
     bool operator==(const HwGeometryRuntimeInfo& other) const {
         return num_outputs == other.num_outputs && outputs == other.outputs && num_invocations &&
                other.num_invocations && output_vertices == other.output_vertices &&
                in_primitive == other.in_primitive &&
                std::ranges::equal(out_primitive, other.out_primitive) &&
-               vs_copy_hash == other.vs_copy_hash;
+               vs_copy_hash == other.vs_copy_hash && stereo == other.stereo;
     }
 };
 

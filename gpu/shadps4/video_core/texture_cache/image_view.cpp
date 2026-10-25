@@ -203,18 +203,34 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         }
     }
 
+    // bbport: stereo 3D in one pass (Image::stereo_layers): the right eye's layer alone
+    // (stereo 1), or both layers as a 2D array for multiview attachments and for shaders
+    // compiled to read the eye's layer (stereo 2) - of one layer when the image has no second
+    // layer, which then reads layer 0 for both eyes.
+    vk::ImageViewType view_type = ConvertImageViewType(info.type);
+    u32 base_layer = info.range.base.layer;
+    u32 layer_count = info.range.extent.layers;
+    if (info.stereo == 1 && image.stereo_layers > 1) {
+        base_layer = 1;
+        layer_count = 1;
+    } else if (info.stereo == 2 && (info.type == AmdGpu::ImageType::Color2D ||
+                                    info.type == AmdGpu::ImageType::Color2DMsaa)) {
+        view_type = vk::ImageViewType::e2DArray;
+        base_layer = 0;
+        layer_count = image.stereo_layers;
+    }
     const vk::ImageViewCreateInfo image_view_ci = {
         .pNext = &usage_ci,
         .image = image.GetImage(),
-        .viewType = ConvertImageViewType(info.type),
+        .viewType = view_type,
         .format = instance.GetSupportedFormat(format, image.format_features),
         .components = info.mapping,
         .subresourceRange{
             .aspectMask = aspect,
             .baseMipLevel = info.range.base.level,
             .levelCount = info.range.extent.levels,
-            .baseArrayLayer = info.range.base.layer,
-            .layerCount = info.range.extent.layers,
+            .baseArrayLayer = base_layer,
+            .layerCount = layer_count,
         },
     };
     // bbport diagnosis: a view whose texels are larger than the image's makes the GPU address

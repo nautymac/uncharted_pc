@@ -54,6 +54,9 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
+    /// bbport: the push constants carry the stereo words (PushData::StereoIndex, 144 bytes;
+    /// the device allows more than the 128 the spec guarantees).
+    bool stereo_push{};
 
     bool operator==(const Profile&) const = default;
 };

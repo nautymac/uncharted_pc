@@ -25,6 +25,10 @@ VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace VideoCore {
 
+/// bbport: stereo 3D in one pass (shader_recompiler/stereo.h): a scene target whose host image
+/// gets a second array layer for the right eye.
+bool StereoEligible(const ImageInfo& info);
+
 enum ImageFlagBits : u32 {
     Empty = 0,
     MaybeCpuDirty = 1 << 0, ///< The page this image is in was touched before the image address
@@ -154,6 +158,9 @@ public:
         u32 vo_surface : 1;
     } usage{};
     bool scene_proxy = false; ///< bbport: SceneTargets holds a reduced-size proxy of it
+    /// bbport: array layers of the host image: 2 for a scene target of the geo stereo mode
+    /// (StereoEligible), while the guest description keeps its one (ImageViewInfo::stereo).
+    u32 stereo_layers = 1;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
     VAddr guest_begin = 0; ///< info.guest_address

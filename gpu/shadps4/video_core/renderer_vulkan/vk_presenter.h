@@ -164,6 +164,9 @@ private:
     std::unique_ptr<FrameGenerator> frame_generator;
     /// The game's picture before its UI, through the same passes as the frame.
     Frame hudless_frame{};
+    /// bbport: stereo 3D in one pass: the right eye (the display buffer's second layer) through
+    /// the same passes as the frame, packed beside it (Stereo::ComposePair).
+    Frame stereo_right_frame{};
     /// bbport: stereo 3D, the two eyes side by side in the frame (instead of frame generation).
     std::unique_ptr<Stereo> stereo;
     /// bbport: the side-by-side picture woven for an SR panel at the present (present thread).
