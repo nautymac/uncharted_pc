@@ -99,6 +99,10 @@ AA_SHARPNESS = [('0', 'Off'), ('0.2', 'Low'), ('0.4', 'Medium'), ('0.7', 'High')
 # Stereo 3D (gpu/shim/bbport_settings.h): how the eyes are made, and where the picture goes.
 STEREO_MODES = [('off', 'Off'), ('geo', 'One pass: both eyes from the same frame (multiview)')]
 STEREO_OUTPUTS = [('sr', 'SR panel (woven in the window)'), ('sbs', 'Side by side in the window')]
+# The 3D page's one list: off, or the one-pass mode (geo) with where the picture goes.
+STEREO_CHOICES = [('off', 'Off'),
+                  ('sr', 'SR monitor (Acer SpatialLabs, Leia SR)'),
+                  ('sbs', 'SBS: side by side (3D TV, 3D monitor)')]
 FRAME_GENERATION = [('off', 'Off'), ('fsr3', 'AMD FSR 3 Frame Generation (any GPU)'),
                     ('dlss', 'NVIDIA DLSS Frame Generation (GeForce RTX 40/50)')]
 BUTTON_PROMPTS = [('auto', 'Automatic (follows the device you used last)'),
@@ -1530,10 +1534,15 @@ class Launcher:
 
     def build_3d(self):
         f = self.page('3d', _('3D'), _('Stereoscopic 3D for an SR panel or a side-by-side 3D display.'))
-        self.row(f, _('3D'), self.choice(f, 'stereo', STEREO_MODES, 40, on_change=self.stereo_mode_changed),
-                 _('One pass: both eyes are drawn from the same frame into two layers of the scene targets '
-                   '(no time difference between the eyes); the UI stays at screen depth. The mode must be set '
-                   'here, before the start; the upscaler and frame generation are off while 3D is on.'))
+        sr = (PORT_DIR / 'bin' / 'ps2sr.dll').is_file() or (PORT_DIR / 'out' / 'ps2sr.dll').is_file()
+        self.row(f, _('3D'), self.stereo_choice(f),
+                 _('SR monitor: woven for an SR panel (Acer SpatialLabs, Leia SR) by the SR runtime through '
+                   'ps2sr.dll; without them the picture stays side by side. SBS: the left eye in the left half '
+                   'and the right eye in the right half, for an ordinary 3D TV or 3D monitor in its '
+                   'side-by-side 3D mode, or a weaver that reads the window. Both eyes are drawn from the same '
+                   'frame (one pass); the UI stays at screen depth. 3D must be set here, before the start; the '
+                   'upscaler and frame generation are off while 3D is on.') +
+                 ('' if sr else ' ' + _('ps2sr.dll was not found next to the game executable.')))
         # Choosing a 3D mode sets the Display page to the settings it was tested with
         # (stereo_display_defaults); this warns while the Display page differs from them.
         holder = self.tk.Frame(self.target(f), bg=CARD)
@@ -1544,12 +1553,6 @@ class Launcher:
                                       self.stereo_mode_changed, padding=(14, 6))
         self.stereo_holder = holder
         holder.grid(row=self.next_row(self.target(f)), column=0, columnspan=2, sticky='w', pady=(8, 0))
-        sr = (PORT_DIR / 'bin' / 'ps2sr.dll').is_file() or (PORT_DIR / 'out' / 'ps2sr.dll').is_file()
-        self.row(f, _('Output'), self.choice(f, 'stereo_output', STEREO_OUTPUTS, 40),
-                 _('SR panel: woven for the panel by the SR SDK, through ps2sr.dll beside the game executable '
-                   'and the SR runtime (Acer SpatialLabs, Leia SR); without them the picture stays side by side. '
-                   'Side by side: for a weaver that reads the window, or a 3D display.') +
-                 ('' if sr else ' ' + _('ps2sr.dll was not found next to the game executable.')))
         from uncharted_widgets import Slider
         self.section(f, _('Depth'))
         self.row(f, _('Eye separation'),
@@ -1572,6 +1575,33 @@ class Launcher:
         for key in ('stereo', *stereo_display_defaults('alt')):
             self.var(key).trace_add('write', lambda *_a: self.update_stereo_warning())
         self.update_stereo_warning()
+
+    def stereo_choice(self, parent):
+        """The 3D list (STEREO_CHOICES) over the two settings it stands for: stereo and stereo_output."""
+        stereo, output = self.var('stereo'), self.var('stereo_output')
+        values = [v for v, _t in STEREO_CHOICES]
+        box = self.ttk.Combobox(parent, values=[_(t) for _v, t in STEREO_CHOICES], state='readonly', width=40)
+        if stereo.get() not in [v for v, _t in STEREO_MODES]:
+            stereo.set('off')
+        if output.get() not in [v for v, _t in STEREO_OUTPUTS]:
+            output.set('sr')
+
+        def show(*_args):
+            box.current(values.index('off' if stereo.get() == 'off' else output.get()))
+        show()
+
+        def selected(_event):
+            choice = values[box.current()]
+            if choice == 'off':
+                stereo.set('off')
+            else:
+                output.set(choice)
+                stereo.set('geo')
+            self.stereo_mode_changed()
+        box.bind('<<ComboboxSelected>>', selected)
+        stereo.trace_add('write', show)
+        output.trace_add('write', show)
+        return box
 
     def stereo_mode_changed(self):
         """A 3D mode was chosen: the Display page gets the settings it was tested with."""
