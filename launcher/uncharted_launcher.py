@@ -43,7 +43,7 @@ AUTHOR = 'SuperMedo'
 # The stereo 3D build (branch stereo-3d) is an add-on over the original PC port of the version
 # before "-3d": it looks for updates among the fork's releases (pre-releases too), whose zip is the
 # add-on, because installing a newer original package over it would remove the 3D build.
-VERSION = '0.3.9-3d.2'
+VERSION = '0.3.9-3d.3'
 RELEASES_API = 'https://api.github.com/repos/nautymac/uncharted_pc/releases?per_page=1'
 RELEASES_PAGE = 'https://github.com/nautymac/uncharted_pc/releases'
 UPDATE_DIR = Path(tempfile.gettempdir()) / 'uncharted-update'

@@ -109,28 +109,15 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
     return num_outputs;
 }
 
-// bbport: stereo 3D in one pass: the pixel shaders that rebuild positions from the scene depth
-// through their texture coordinate, corrected per eye in stereo passes (stereo_unshift_pass.cpp):
-// BB_STEREO_UNSHIFT_PS=<hash>,..., else BB_JITTER_PS (run.py), the same full-screen passes.
-static bool StereoUnshiftShader(u64 hash) {
-    static const std::vector<u32> listed = [] {
-        std::vector<u32> list;
-        const char* env = std::getenv("BB_STEREO_UNSHIFT_PS");
-        if (!env) {
-            env = std::getenv("BB_JITTER_PS");
-        }
-        for (const char* p = env ? env : ""; *p;) {
-            char* end;
-            const u64 value = std::strtoull(p, &end, 16);
-            if (end == p) {
-                break;
-            }
-            list.push_back(u32(value));
-            p = *end == ',' ? end + 1 : end;
-        }
-        return list;
+// bbport: stereo 3D in one pass: fragment shaders that rebuild positions from the scene depth
+// through their texture coordinate are corrected per eye (stereo_unshift_pass.cpp decides by
+// the pattern, in every fragment shader of the geo mode); BB_STEREO_UNSHIFT=0 switches it off.
+static bool StereoUnshiftEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_STEREO_UNSHIFT");
+        return !env || env[0] != '0';
     }();
-    return std::ranges::find(listed, u32(hash)) != listed.end();
+    return enabled;
 }
 
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& sel, HwStage stage,
@@ -227,8 +214,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         info.hw.fs.motion_vectors = sel.motion;
         // Not sel.stereo: the pass is decided once the fragment shader is known. In a one-layer
         // pass the separation is 0 (SetStereoPushData), which leaves the positions as they are.
-        info.hw.fs.stereo_unshift = Shader::Stereo::geo_layers &&
-                                    StereoUnshiftShader(AmdGpu::GetParams(regs.ps_program).hash);
+        info.hw.fs.stereo_unshift = Shader::Stereo::geo_layers && StereoUnshiftEnabled();
         u8 stencil_ref_export_enable = regs.depth_shader_control.stencil_op_val_export_enable |
                                        regs.depth_shader_control.stencil_test_val_export_enable;
         info.hw.fs.mrtz_mask = regs.depth_shader_control.z_export_enable |
