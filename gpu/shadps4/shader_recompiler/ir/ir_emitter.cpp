@@ -1080,6 +1080,10 @@ F32F64 IREmitter::FPFma(const F32F64& a, const F32F64& b, const F32F64& c) {
     }
 }
 
+F32 IREmitter::StereoUnshiftX(const F32& sz, const F32& z) {
+    return Inst<F32>(Opcode::StereoUnshiftX, sz, z);
+}
+
 F32F64 IREmitter::FPAbs(const F32F64& value) {
     switch (value.Type()) {
     case Type::F32:

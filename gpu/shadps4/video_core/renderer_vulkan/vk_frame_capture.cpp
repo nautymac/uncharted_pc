@@ -45,6 +45,7 @@ struct Entry {
 
 // GPU thread only.
 std::vector<Entry> entries;
+u32 recording_serial = 0; ///< bbport: counts the starts of a recording (DumpStereo)
 std::vector<std::pair<Target, bool>> pending_sampled;
 std::vector<std::string> pending_buffers;
 
@@ -366,6 +367,7 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
             if (dump_requested.load(std::memory_order_acquire)) {
                 StartDump();
             }
+            ++recording_serial;
             state.store(Recording, std::memory_order_release);
         } else if (state.load(std::memory_order_relaxed) == Recording && now >= record_start_flip + 2) {
             Write(last_presented.load(std::memory_order_relaxed));
@@ -391,6 +393,7 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
         pending_sampled.clear();
         pending_buffers.clear();
         pass_open = false;
+        ++recording_serial;
         state.store(Recording, std::memory_order_release);
     }
     if (state.load(std::memory_order_relaxed) != Recording) {
@@ -518,6 +521,123 @@ void FrameCapture::DumpTexture(Runtime& runtime, VideoCore::Image& image) {
                     info.guest_address, width, height, name, DxgiFormat(format) ? "dds" : "raw");
     if (!SaveImage(runtime, image, size, path)) {
         ++dump_skipped;
+    }
+}
+
+void FrameCapture::DumpStereo(Runtime& runtime, VideoCore::Image& image) {
+    static const char* env = std::getenv("BB_STEREO_DUMP");
+    if (!env || state.load(std::memory_order_relaxed) != Recording || image.stereo_layers != 2) {
+        return;
+    }
+    static float rect[4] = {0.f, 0.55f, 0.25f, 0.95f};
+    static const bool parsed = [] {
+        std::sscanf(env, "%f,%f,%f,%f", &rect[0], &rect[1], &rect[2], &rect[3]);
+        return true;
+    }();
+    (void)parsed;
+    static u32 serial = ~0u, events = 0;
+    static std::vector<std::pair<Target, u32>> counts;
+    if (serial != recording_serial) {
+        serial = recording_serial;
+        events = 0;
+        counts.clear();
+    }
+    const auto& info = image.info;
+    if (info.num_samples > 1 || image.backing->num_samples != 1 ||
+        !(image.usage_flags & vk::ImageUsageFlagBits::eTransferSrc) || events >= 800) {
+        return;
+    }
+    const Target target = ToTarget(info);
+    auto it = std::ranges::find(counts, target, &std::pair<Target, u32>::first);
+    if (it == counts.end()) {
+        counts.emplace_back(target, 0);
+        it = counts.end() - 1;
+    }
+    if (it->second >= 4) {
+        return;
+    }
+    ++it->second;
+    const vk::Format format = info.pixel_format;
+    const bool depth = info.props.is_depth;
+    u32 bpp = 0;
+    if (depth) {
+        bpp = format == vk::Format::eD16Unorm || format == vk::Format::eD16UnormS8Uint ? 2 : 4;
+    } else if (!vk::componentsAreCompressed(format)) {
+        bpp = vk::blockSize(format);
+    }
+    if (bpp == 0) {
+        return;
+    }
+    const u32 width = info.size.width, height = info.size.height;
+    const s32 x0 = s32(rect[0] * float(width)), y0 = s32(rect[1] * float(height));
+    const u32 w = u32(std::max(1.f, (rect[2] - rect[0]) * float(width)));
+    const u32 h = u32(std::max(1.f, (rect[3] - rect[1]) * float(height)));
+    const u64 layer_size = u64(w) * h * bpp;
+    const char* env_dir = std::getenv("BB_CAPTURE_DIR");
+    const std::string dir = env_dir ? env_dir : ".";
+    const u32 event = events++;
+    const u32 pass = u32(entries.size());
+    {
+        FILE* index = std::fopen((dir + "/stereo_index.txt").c_str(), event == 0 ? "w" : "a");
+        if (index) {
+            std::fprintf(index, "%u pass %u addr %#llx %ux%u %s bpp %u depth %d rect %d %d %u %u\n",
+                         event, pass, static_cast<unsigned long long>(info.guest_address), width,
+                         height, vk::to_string(format).c_str(), bpp, int(depth), x0, y0, w, h);
+            std::fclose(index);
+        }
+    }
+    const Instance& instance = runtime.GetInstance();
+    Scheduler& scheduler = runtime.GetScheduler();
+    scheduler.EndRendering();
+    if (runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead)) {
+        runtime.FlushBarriers();
+    }
+    for (u32 layer = 0; layer < 2; ++layer) {
+        const VkBufferCreateInfo buffer_ci{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = layer_size,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        };
+        const VmaAllocationCreateInfo alloc_ci{
+            .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        };
+        VkBuffer buffer{};
+        VmaAllocation allocation{};
+        VmaAllocationInfo allocation_info{};
+        if (vmaCreateBuffer(instance.GetAllocator(), &buffer_ci, &alloc_ci, &buffer, &allocation,
+                            &allocation_info) != VK_SUCCESS) {
+            return;
+        }
+        const vk::BufferImageCopy region{
+            .imageSubresource = {depth ? vk::ImageAspectFlagBits::eDepth
+                                       : vk::ImageAspectFlagBits::eColor,
+                                 0, layer, 1},
+            .imageOffset = {x0, y0, 0},
+            .imageExtent = {w, h, 1},
+        };
+        scheduler.Record([src = image.GetImage(), dst = vk::Buffer(buffer),
+                          region](vk::CommandBuffer cmdbuf) {
+            cmdbuf.copyImageToBuffer(src, vk::ImageLayout::eTransferSrcOptimal, dst, region);
+            const vk::MemoryBarrier2 to_host{
+                .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+            };
+            cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host});
+        });
+        const std::string path = std::format("{}/stereo_{:04}_L{}.raw", dir, event, layer);
+        scheduler.DeferPriorityOperation([allocator = instance.GetAllocator(), buffer, allocation,
+                                          allocation_info, layer_size, path] {
+            vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(allocation_info.pMappedData, 1, layer_size, f);
+                std::fclose(f);
+            }
+            vmaDestroyBuffer(allocator, buffer, allocation);
+        });
     }
 }
 

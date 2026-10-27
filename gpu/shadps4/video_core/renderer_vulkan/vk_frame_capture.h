@@ -54,6 +54,11 @@ public:
     static void ArmTextureDump();
     /// GPU thread, for each sampled texture: the copy for ArmTextureDump while recording.
     static void DumpTexture(Runtime& runtime, VideoCore::Image& image);
+    /// bbport diagnosis, stereo 3D in one pass: BB_STEREO_DUMP=x0,y0,x1,y1 (fractions of the
+    /// image): while a frame is recorded, each sampled image with a layer per eye is saved, that
+    /// rectangle of both layers, at each of its first 4 reads (raw, listed in stereo_index.txt
+    /// with the pass it was read in), to find the first pass where the eyes differ.
+    static void DumpStereo(Runtime& runtime, VideoCore::Image& image);
 
     /// BB_ICON_COLLECT=1: each compressed picture that a pass drawing into a display buffer
     /// samples (the HUD and button prompts) is saved once, in <user>/button_icons, to add new

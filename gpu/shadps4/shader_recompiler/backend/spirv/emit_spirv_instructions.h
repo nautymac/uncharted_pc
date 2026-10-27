@@ -249,6 +249,7 @@ Id EmitFPMinTri32(EmitContext& ctx, Id a, Id b, Id c);
 Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c);
 Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c);
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b);
+Id EmitStereoUnshiftX(EmitContext& ctx, Id sz, Id z); // bbport: stereo 3D in one pass
 Id EmitFPMul64(EmitContext& ctx, IR::Inst* inst, Id a, Id b);
 Id EmitFPDiv32(EmitContext& ctx, IR::Inst* inst, Id a, Id b);
 Id EmitFPDiv64(EmitContext& ctx, IR::Inst* inst, Id a, Id b);

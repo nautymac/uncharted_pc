@@ -212,6 +212,30 @@ static void EmitStereoOffset(EmitContext& ctx) {
     ctx.OpStore(ctx.output_position, ctx.OpCompositeInsert(ctx.F32[4], new_x, position, 0u));
 }
 
+// bbport: stereo 3D in one pass: the inverse of EmitStereoOffset for a fragment shader that
+// rebuilds positions from the scene depth as (s * z, t * z, z), s and t the texture coordinate of
+// the pixel and z the linear depth there (Uncharted's sun shadow pass): the eye's picture shows a
+// point at s_eye = s + 1/2 * eye_sep * (1 - conv / z), so the centre camera's s * z, which the
+// game's matrices expect, is s_eye * z - 1/2 * eye_sep * (z - conv).
+Id EmitStereoUnshiftX(EmitContext& ctx, Id sz, Id z) {
+    if (!Sirit::ValidId(ctx.view_index) || !ctx.profile.stereo_push) {
+        return sz;
+    }
+    const Id f32 = ctx.F32[1];
+    const Id ptr_type = ctx.TypePointer(spv::StorageClass::PushConstant, f32);
+    const Id sep = ctx.OpLoad(f32, ctx.OpAccessChain(ptr_type, ctx.push_data_block,
+                                                     ctx.ConstU32(PushData::StereoIndex),
+                                                     ctx.ConstU32(0u)));
+    const Id conv = ctx.OpLoad(f32, ctx.OpAccessChain(ptr_type, ctx.push_data_block,
+                                                      ctx.ConstU32(PushData::StereoIndex),
+                                                      ctx.ConstU32(1u)));
+    const Id right = ctx.OpINotEqual(ctx.U1[1], ctx.StereoLayer(), ctx.u32_zero_value);
+    const Id eye_sep = ctx.OpSelect(f32, right, sep, ctx.OpFNegate(f32, sep));
+    const Id shift =
+        ctx.OpFMul(f32, ctx.OpFMul(f32, eye_sep, ctx.ConstF32(0.5f)), ctx.OpFSub(f32, z, conv));
+    return ctx.OpFSub(f32, sz, shift);
+}
+
 void EmitEpilogue(EmitContext& ctx) {
     if (Sirit::ValidId(ctx.motion_out_cur)) {
         EmitVertexMotion(ctx);

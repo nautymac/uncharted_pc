@@ -25,6 +25,7 @@ void LowerPhisToRegsPass(IR::Program& program);
 void DeadCodeEliminationPass(IR::Program& program);
 /// bbport: exact integers from interpolated float varyings on GPUs without manual interpolation.
 void InterpolatedIntegerPass(IR::Program& program);
+void StereoUnshiftPass(IR::Program& program);
 void ConstantPropagationPass(IR::BlockList& program);
 void FlattenExtendedUserdataPass(IR::Program& program);
 void ReadLaneEliminationPass(IR::Program& program);

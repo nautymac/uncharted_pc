@@ -184,6 +184,9 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     if (info.sw_stage == SwStage::Fragment && profile.needs_integer_interpolation_fix) {
         Shader::Optimization::InterpolatedIntegerPass(program);
     }
+    if (info.sw_stage == SwStage::Fragment && runtime_info.hw.fs.stereo_unshift) {
+        Shader::Optimization::StereoUnshiftPass(program); // bbport: stereo 3D in one pass
+    }
     Shader::Optimization::CollectShaderInfoPass(program, profile);
     Shader::IR::DumpProgram(program, info);
 

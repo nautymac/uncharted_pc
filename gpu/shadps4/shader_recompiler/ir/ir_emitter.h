@@ -224,6 +224,9 @@ public:
     [[nodiscard]] F32F64 FPMul(const F32F64& a, const F32F64& b);
     [[nodiscard]] F32F64 FPDiv(const F32F64& a, const F32F64& b);
     [[nodiscard]] F32F64 FPFma(const F32F64& a, const F32F64& b, const F32F64& c);
+    /// bbport: stereo 3D in one pass: a position rebuilt as s * z (s a texture coordinate of the
+    /// eye's picture, z the depth there) moved back to the centre camera (stereo_unshift_pass).
+    [[nodiscard]] F32 StereoUnshiftX(const F32& sz, const F32& z);
 
     [[nodiscard]] F32F64 FPAbs(const F32F64& value);
     [[nodiscard]] F32F64 FPNeg(const F32F64& value);

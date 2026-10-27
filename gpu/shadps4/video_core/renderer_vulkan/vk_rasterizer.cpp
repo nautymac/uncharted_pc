@@ -39,6 +39,7 @@
 namespace Vulkan {
 
 static bool StereoDispatch(const Shader::Info& cs); // bbport: stereo 3D in one pass
+static void LogStereoResources(const char* kind, const Shader::Info& info, bool stereo);
 
 // bbport diagnosis: BB_CONST_CHECK=<shader hash>: the constants of that shader's draws as they
 // were packed for recording (user data, the flattened resource table read through it, constant
@@ -1753,8 +1754,16 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             });
         }
     }
-    SetStereoPushData();
+    SetStereoPushData(pipeline->GetGraphicsKey().stereo != 0);
     pipeline->BindResources(set_writes, push_data);
+    if (pipeline->GetGraphicsKey().stereo) {
+        for (const auto* stage : pipeline->GetStages()) {
+            if (stage) {
+                LogStereoResources(stage->sw_stage == Shader::SwStage::Fragment ? "PS" : "VS", *stage,
+                                   true);
+            }
+        }
+    }
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
     draw_jitter = {};
@@ -1938,7 +1947,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     push_data.xoffset *= target_scale[0];
     push_data.yscale *= target_scale[1];
     push_data.yoffset *= target_scale[1];
-    SetStereoPushData();
+    SetStereoPushData(pipeline->GetGraphicsKey().stereo != 0);
     pipeline->BindResources(set_writes, push_data);
     draw_jitter = {};
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth()) {
@@ -2253,6 +2262,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     }();
     const void* checkpoint = NoteCheckpoint("dispatch", cs.pgm_hash, 0, dim_x, dim_y, dim_z, 0);
     const bool stereo_dispatch = StereoDispatch(cs);
+    LogStereoResources("CS", cs, stereo_dispatch);
     const vk::PipelineLayout layout = pipeline->GetLayout();
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         const vk::MemoryBarrier2 barrier = {
@@ -2341,6 +2351,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
         NoteCheckpoint("indirect dispatch", pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,
                        0, size, 0, 0, address + offset);
     const bool stereo_dispatch = StereoDispatch(pipeline->GetStage(Shader::SwStage::Compute));
+    LogStereoResources("CS", pipeline->GetStage(Shader::SwStage::Compute), stereo_dispatch);
     const vk::PipelineLayout layout = pipeline->GetLayout();
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         if (checkpoint) {
@@ -3583,6 +3594,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 image_id, desc, memo_entry ? &memo_entry->view_memo : nullptr, !on_helper);
             if (FrameCapture::Active() && !is_storage) {
                 FrameCapture::DumpTexture(runtime, image);
+                FrameCapture::DumpStereo(runtime, image);
             }
             if (collect_icons && !is_storage) {
                 FrameCapture::CollectIcon(runtime, image);
@@ -3840,13 +3852,15 @@ bool Rasterizer::TargetsStereo(const GraphicsPipeline* pipeline) {
     return targets > 0;
 }
 
-void Rasterizer::SetStereoPushData() {
+void Rasterizer::SetStereoPushData(bool both_eyes) {
     // stereo.h: x += sep * (w - conv); depth 1.0 (% of the width) is a shift of 0.01 in NDC
     // per eye at infinity. The swap changes the sign: layer 0 (shown left) then gets the
-    // right eye's picture.
+    // right eye's picture. A one-layer draw gets no separation (its fragment shaders' per-eye
+    // corrections, stereo_unshift_pass.cpp, then change nothing).
     const auto& s = BbSettings::Get();
     const float sign = s.stereo_swap ? -1.0f : 1.0f;
-    push_data.stereo = {sign * s.stereo_depth.load() / 100.0f, s.stereo_convergence.load()};
+    push_data.stereo = {both_eyes ? sign * s.stereo_depth.load() / 100.0f : 0.0f,
+                        s.stereo_convergence.load()};
     push_data.stereo_eye = 0;
     push_data.stereo_pad = 0;
 }
@@ -3863,6 +3877,48 @@ static bool StereoDispatch(const Shader::Info& cs) {
         }
     }
     return false;
+}
+
+// bbport diagnosis: BB_STEREO_LOG=2 — once per shader (first 256): the images and buffers a
+// draw or dispatch of the geo mode binds, which of them have a layer per eye (E) and which are
+// shared by the eyes (shared), and which it writes (W). Shared data written by work done once
+// per eye keeps one eye's result for both (compute: the left eye's, dispatched last).
+static void LogStereoResources(const char* kind, const Shader::Info& info, bool stereo) {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_STEREO_LOG");
+        return env && env[0] == '2';
+    }();
+    if (!on || !Shader::Stereo::geo_layers) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_set<u64> logged;
+    std::scoped_lock lock{mutex};
+    if (logged.size() >= 256 || !logged.insert(info.pgm_hash ^ (u64(stereo) << 63)).second) {
+        return;
+    }
+    std::string text;
+    for (size_t i = 0; i < info.images.size(); ++i) {
+        const auto& res = info.images[i];
+        const auto sharp = res.GetSharp(info);
+        text += fmt::format(" | img{} {}x{}x{} type{} layers{} fmt{}/{} {}{}", i, sharp.width + 1,
+                            sharp.height + 1, sharp.depth + 1, u32(sharp.GetType()),
+                            sharp.NumLayers(), u32(sharp.GetDataFmt()), u32(sharp.GetNumberFmt()),
+                            Shader::Stereo::ImageSharp(sharp, res.is_array) ? "E" : "shared",
+                            res.is_written ? " W" : "");
+    }
+    for (size_t i = 0; i < info.buffers.size(); ++i) {
+        const auto& res = info.buffers[i];
+        if (res.IsSpecial()) {
+            continue;
+        }
+        const auto sharp = res.GetSharp(info);
+        text += fmt::format(" | buf{} {:#x}+{} stride{}{}{}", i, sharp.base_address,
+                            sharp.GetSize(), sharp.GetStride(), res.is_formatted ? " typed" : "",
+                            res.is_written ? " W" : "");
+    }
+    std::printf("Stereo 3D: %s %08x %s%s\n", kind, u32(info.pgm_hash), stereo ? "STEREO" : "mono",
+                text.c_str());
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {

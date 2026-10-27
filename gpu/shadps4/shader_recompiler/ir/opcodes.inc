@@ -239,6 +239,7 @@ OPCODE(FPAdd32,                                             F32,            F32,
 OPCODE(FPAdd64,                                             F64,            F64,            F64,                                                            )
 OPCODE(FPSub32,                                             F32,            F32,            F32,                                                            )
 OPCODE(FPFma32,                                             F32,            F32,            F32,            F32,                                            )
+OPCODE(StereoUnshiftX,                                      F32,            F32,            F32,                                                            )
 OPCODE(FPFma64,                                             F64,            F64,            F64,            F64,                                            )
 OPCODE(FPMax32,                                             F32,            F32,            F32,                                                            )
 OPCODE(FPMax64,                                             F64,            F64,            F64,                                                            )

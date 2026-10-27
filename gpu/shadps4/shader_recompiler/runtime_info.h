@@ -238,6 +238,9 @@ struct HwFragmentRuntimeInfo {
     bool clip_distance_emulation{false};
     /// bbport: writes the object motion vector to MotionVectors::Output.
     bool motion_vectors{false};
+    /// bbport: stereo 3D in one pass: the shader rebuilds positions from the scene depth through
+    /// its texture coordinate, corrected per eye (stereo_unshift_pass.cpp).
+    bool stereo_unshift{false};
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -247,7 +250,7 @@ struct HwFragmentRuntimeInfo {
                front_face_all_bits == other.front_face_all_bits &&
                dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
-               motion_vectors == other.motion_vectors &&
+               motion_vectors == other.motion_vectors && stereo_unshift == other.stereo_unshift &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }

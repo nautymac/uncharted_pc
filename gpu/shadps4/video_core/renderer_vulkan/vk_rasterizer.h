@@ -263,7 +263,7 @@ private:
     /// bbport: stereo 3D in one pass: every target of the pass has two layers (stereo.h).
     bool TargetsStereo(const GraphicsPipeline* pipeline);
     /// The settings' stereo parameters into push_data for this draw or dispatch.
-    void SetStereoPushData();
+    void SetStereoPushData(bool both_eyes = true);
 
     void BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
                      Shader::Backend::Bindings& binding,
