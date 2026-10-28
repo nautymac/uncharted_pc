@@ -26,7 +26,7 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 11u; // bbport: motion shaders hold address stand-ins (10); scalar instructions split EXEC scopes (11)
-static constexpr u32 ShaderMetaVersion = 11u; // bbport: stereo_unshift for depth * linear(coordinate)
+static constexpr u32 ShaderMetaVersion = 12u; // bbport: stereo_unshift moves a product once, the depth operand free of the coordinate
 static constexpr u32 PipelineKeyVersion = 6u; // bbport: GraphicsPipelineKey::stereo
 /// bbport (BilalReloaded): the cache name of a shader's SPIR-V. Shaders that gained multi-wave
 /// LDS barriers get a new name, so their binaries cached before the fix are not found and only

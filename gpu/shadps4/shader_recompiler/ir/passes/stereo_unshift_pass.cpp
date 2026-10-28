@@ -18,7 +18,16 @@
 // value read at the coordinate) and E is linear in s with a non-zero coefficient (built from the
 // shader's own constants and uniforms). Only that product changes; t, the sample and everything
 // else stay.
+//
+// Z must not depend on s itself, and a product is moved once: the moved product is the centre
+// camera's position, and everything computed from it (the vector to a light and its squared
+// length, the projection into a light's shadow map with its divide by w) is the centre camera's
+// already. Products of two such values (x * x, x * (1 / w)) are not "depth times linear in s" and
+// must stay as they are: moved as if their first operand were the depth, they lit the eyes of
+// Uncharted 2 and 3 differently around every point and spot light (seven to sixteen moves per
+// deferred light shader, one of them right).
 
+#include <algorithm>
 #include <cstdio>
 #include <optional>
 #include <unordered_map>
@@ -93,7 +102,11 @@ std::vector<IR::Value> SampleCoords(const IR::Inst& inst) {
     return coords;
 }
 
-/// Arithmetic that carries a sampled depth to the multiplier (z = c / (d - c0), scales, ...).
+/// Arithmetic that carries a sampled depth to the multiplier: the linear depth is an affine or
+/// reciprocal function of the texel (z = c / (d - c0), scales). A clamped, saturated, min/max'd or
+/// selected value is a weight or a guard, not the depth: the velocity pass multiplies its motion
+/// vector (prev_s - s, linear in s) by such a depth-range weight, and the correction, exact only
+/// when Z is the depth, would move the motion vector by 1/2 * eye_sep * (weight - conv).
 bool CarriesValue(IR::Opcode op) {
     switch (op) {
     case IR::Opcode::FPMul32:
@@ -103,17 +116,11 @@ bool CarriesValue(IR::Opcode op) {
     case IR::Opcode::FPSub32:
     case IR::Opcode::FPFma32:
     case IR::Opcode::FPNeg32:
-    case IR::Opcode::FPAbs32:
-    case IR::Opcode::FPMax32:
-    case IR::Opcode::FPMin32:
-    case IR::Opcode::FPSaturate32:
-    case IR::Opcode::FPClamp32:
     case IR::Opcode::CompositeExtractF32x2:
     case IR::Opcode::CompositeExtractF32x3:
     case IR::Opcode::CompositeExtractF32x4:
     case IR::Opcode::BitCastF32U32:
     case IR::Opcode::BitCastU32F32:
-    case IR::Opcode::SelectF32:
         return true;
     default:
         return false;
@@ -158,9 +165,14 @@ bool FromDepthAt(const IR::Value& value, const IR::Value& coord, const Info& inf
     return false;
 }
 
+/// The products already moved: a value computed from one is the centre camera's, so it does not
+/// depend on the eye's s any more.
+using Moved = std::unordered_set<const IR::Inst*>;
+
 /// Whether `value` depends on the coordinate `s` through arithmetic. A sample (its result is a
-/// texel, not the coordinate), a buffer load and an attribute other than s are boundaries.
-bool DependsOn(const IR::Value& value, const IR::Value& s,
+/// texel, not the coordinate), a buffer load, an attribute other than s and a moved product are
+/// boundaries.
+bool DependsOn(const IR::Value& value, const IR::Value& s, const Moved& moved,
                std::unordered_map<const IR::Inst*, bool>& memo, u32 depth) {
     if (value == s) {
         return true;
@@ -177,9 +189,10 @@ bool DependsOn(const IR::Value& value, const IR::Value& s,
     }
     memo[inst] = false; // cycles (phis) count as independent
     bool depends = false;
-    if (!IsSample(inst->GetOpcode()) && inst->GetOpcode() != IR::Opcode::Phi) {
+    if (!IsSample(inst->GetOpcode()) && inst->GetOpcode() != IR::Opcode::Phi &&
+        !moved.contains(inst)) {
         for (size_t i = 0; i < inst->NumArgs() && !depends; ++i) {
-            depends = DependsOn(inst->Arg(i), s, memo, depth + 1);
+            depends = DependsOn(inst->Arg(i), s, moved, memo, depth + 1);
         }
     }
     memo[inst] = depends;
@@ -190,11 +203,12 @@ bool DependsOn(const IR::Value& value, const IR::Value& s,
 /// multiplies by s-independent values, adds, subtracts, negations and fmas; nullopt otherwise.
 /// A zero coefficient is an immediate 0.
 std::optional<IR::F32> Coefficient(const IR::Value& value, const IR::Value& s, IR::IREmitter& ir,
+                                   const Moved& moved,
                                    std::unordered_map<const IR::Inst*, bool>& memo, u32 depth) {
     if (value == s) {
         return IR::F32{ir.Imm32(1.0f)};
     }
-    if (!DependsOn(value, s, memo, 0)) {
+    if (!DependsOn(value, s, moved, memo, 0)) {
         return IR::F32{ir.Imm32(0.0f)};
     }
     if (depth > 24) {
@@ -222,23 +236,23 @@ std::optional<IR::F32> Coefficient(const IR::Value& value, const IR::Value& s, I
     };
     switch (inst->GetOpcode()) {
     case IR::Opcode::FPAdd32: {
-        const auto a = Coefficient(inst->Arg(0), s, ir, memo, depth + 1);
-        const auto b = Coefficient(inst->Arg(1), s, ir, memo, depth + 1);
+        const auto a = Coefficient(inst->Arg(0), s, ir, moved, memo, depth + 1);
+        const auto b = Coefficient(inst->Arg(1), s, ir, moved, memo, depth + 1);
         if (!a || !b) {
             return std::nullopt;
         }
         return add(*a, *b);
     }
     case IR::Opcode::FPSub32: {
-        const auto a = Coefficient(inst->Arg(0), s, ir, memo, depth + 1);
-        const auto b = Coefficient(inst->Arg(1), s, ir, memo, depth + 1);
+        const auto a = Coefficient(inst->Arg(0), s, ir, moved, memo, depth + 1);
+        const auto b = Coefficient(inst->Arg(1), s, ir, moved, memo, depth + 1);
         if (!a || !b) {
             return std::nullopt;
         }
         return add(*a, is_zero(*b) ? *b : IR::F32{ir.FPNeg(*b)});
     }
     case IR::Opcode::FPNeg32: {
-        const auto a = Coefficient(inst->Arg(0), s, ir, memo, depth + 1);
+        const auto a = Coefficient(inst->Arg(0), s, ir, moved, memo, depth + 1);
         if (!a) {
             return std::nullopt;
         }
@@ -247,18 +261,18 @@ std::optional<IR::F32> Coefficient(const IR::Value& value, const IR::Value& s, I
     case IR::Opcode::FPMul32:
     case IR::Opcode::FPFma32: {
         const IR::Value x = inst->Arg(0), y = inst->Arg(1);
-        const bool dx = DependsOn(x, s, memo, 0), dy = DependsOn(y, s, memo, 0);
+        const bool dx = DependsOn(x, s, moved, memo, 0), dy = DependsOn(y, s, moved, memo, 0);
         std::optional<IR::F32> product;
         if (dx && dy) {
             return std::nullopt; // not linear in s
         } else if (dx) {
-            const auto a = Coefficient(x, s, ir, memo, depth + 1);
+            const auto a = Coefficient(x, s, ir, moved, memo, depth + 1);
             if (!a) {
                 return std::nullopt;
             }
             product = mul(*a, y);
         } else if (dy) {
-            const auto b = Coefficient(y, s, ir, memo, depth + 1);
+            const auto b = Coefficient(y, s, ir, moved, memo, depth + 1);
             if (!b) {
                 return std::nullopt;
             }
@@ -269,7 +283,7 @@ std::optional<IR::F32> Coefficient(const IR::Value& value, const IR::Value& s, I
         if (inst->GetOpcode() == IR::Opcode::FPMul32) {
             return product;
         }
-        const auto c = Coefficient(inst->Arg(2), s, ir, memo, depth + 1);
+        const auto c = Coefficient(inst->Arg(2), s, ir, moved, memo, depth + 1);
         if (!c) {
             return std::nullopt;
         }
@@ -320,6 +334,7 @@ void StereoUnshiftPass(IR::Program& program) {
                     }
                 }
             }
+            const Moved none;
             for (IR::Inst* mul : derived) {
                 if (taken.contains(mul)) {
                     continue;
@@ -331,7 +346,8 @@ void StereoUnshiftPass(IR::Program& program) {
                         continue;
                     }
                     std::unordered_map<const IR::Inst*, bool> memo;
-                    if (!DependsOn(e, s, memo, 0)) {
+                    // Z is the texel's depth, not a position already built from s (x * x, x / w).
+                    if (DependsOn(z, s, none, memo, 0) || !DependsOn(e, s, none, memo, 0)) {
                         continue;
                     }
                     taken.insert(mul);
@@ -341,6 +357,15 @@ void StereoUnshiftPass(IR::Program& program) {
             }
         }
     }
+    // In program order, so that a product is moved before the products computed from it see it.
+    std::unordered_map<const IR::Inst*, u32> order;
+    for (IR::Block* const block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            order.emplace(&inst, u32(order.size()));
+        }
+    }
+    std::ranges::sort(targets, {}, [&](const Target& t) { return order.at(t.product); });
+    Moved moved_products;
     u32 patched = 0;
     for (const auto& target : targets) {
         IR::Block* block = target.product->GetParent();
@@ -348,7 +373,10 @@ void StereoUnshiftPass(IR::Program& program) {
         ++next;
         IR::IREmitter ir{*block, next};
         std::unordered_map<const IR::Inst*, bool> memo;
-        const auto coeff = Coefficient(target.e, target.s, ir, memo, 0);
+        if (!DependsOn(target.e, target.s, moved_products, memo, 0)) {
+            continue; // on s only through a moved product: the centre camera's already
+        }
+        const auto coeff = Coefficient(target.e, target.s, ir, moved_products, memo, 0);
         if (!coeff || (coeff->IsImmediate() && coeff->F32() == 0.0f)) {
             continue; // not linear in s: left alone (the coefficient instructions, if any, are dead)
         }
@@ -361,6 +389,7 @@ void StereoUnshiftPass(IR::Program& program) {
                 use.user->SetArg(use.operand, moved);
             }
         }
+        moved_products.insert(moved.Inst());
         ++patched;
     }
     if (!patched) {
