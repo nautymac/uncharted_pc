@@ -34,6 +34,7 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+class StereoAutoConvergence; // bbport: vk_stereo_autoconv.h
 
 class Rasterizer {
 public:
@@ -359,6 +360,7 @@ private:
     u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
     bool gbuffer_draw = false;
     std::unique_ptr<TemporalUpscaler> upscaler; // bbport: FSR (docs/upscaler.md)
+    std::unique_ptr<StereoAutoConvergence> stereo_autoconv; // bbport: stereo 3D auto convergence
     std::array<float, 2> draw_jitter{};         ///< viewport offset of the current draw, pixels
     std::array<float, 2> target_scale{1.0f, 1.0f}; ///< pass drawn into the upscaler's output-size images
     const bool host_markers_enabled;

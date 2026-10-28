@@ -107,6 +107,13 @@ struct Values {
     std::atomic<int> stereo{StereoOff};
     std::atomic<float> stereo_depth{1.0f};
     std::atomic<float> stereo_convergence{3.0f};
+    /// Automatic convergence (vk_stereo_autoconv.h): the nearest thing in the picture is kept at
+    /// screen depth, times the bias (what Ctrl+F7/F8 change then; 1 at the screen, above 1 a
+    /// little in front). stereo_convergence_live is the value the frame is drawn with (the fixed
+    /// one without auto); the key notice and the menu show it. Not saved.
+    std::atomic<bool> stereo_auto_convergence{false};
+    std::atomic<float> stereo_auto_bias{1.0f};
+    std::atomic<float> stereo_convergence_live{3.0f};
     std::atomic<bool> stereo_swap{false};
     std::atomic<int> stereo_output{StereoOutputSr};
     /// Why the SR panel's weaver is not in use, or null (set by the presenter).

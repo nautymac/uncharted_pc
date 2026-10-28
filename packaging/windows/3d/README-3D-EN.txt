@@ -43,8 +43,13 @@ Requirements
 
 Keys in the game
 ----------------
+Ctrl+F4       automatic convergence on / off (also a checkbox on the launcher's 3D page): the
+              nearest thing in the picture is kept at screen depth, so nothing comes out in front
+              of the screen, and the convergence follows the scene as the camera moves
 Ctrl+F5 / F6  depth (eye separation) - / +
-Ctrl+F7 / F8  convergence - / + (the distance that sits at screen depth, 3 m by default)
+Ctrl+F7 / F8  convergence - / + (the distance that sits at screen depth, 3 m by default); with
+              the automatic convergence, its bias: above 1 the nearest thing comes out a little,
+              below 1 everything sits behind the screen
 Ctrl+F9       swap the eyes
 Insert        settings menu, "3D (stereo)"
 Values are saved at once and come back to the launcher's 3D page when the game closes. Whether 3D

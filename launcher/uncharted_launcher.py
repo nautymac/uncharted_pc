@@ -211,7 +211,7 @@ APP_DEFAULTS = {'game_dir': '', 'game_dir_u1': '', 'game_dir_u2': '', 'game_dir_
                 'anti_aliasing': 'off', 'aa_sharpness': '0.2', 'frame_generation': 'off',
                 'frame_gen_multiplier': '2', 'extra_env': '', 'close_on_play': False,
                 'stereo': 'off', 'stereo_output': 'sr', 'stereo_depth': '1.0', 'stereo_convergence': '3.0',
-                'stereo_swap': False,
+                'stereo_auto_convergence': False, 'stereo_auto_bias': '1.0', 'stereo_swap': False,
                 'mouse_look': True, 'mouse_sensitivity': '1.0', 'mouse_invert_y': False,
                 'pad_invert_y': False, 'art_banner': '', 'art_u1': '', 'art_u2': '', 'art_u3': '', 'steam_art': '', 'art_crops': {}, 'shortcut_name': 'Uncharted: The Nathan Drake Collection', 'shortcut_icon': '', 'trophy_game': 'u1', 'pad_vibration': True, 'pad_vibration_strength': '100', 'button_prompts': 'auto', 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True,
                 **{key: 'auto' for key in FIXES},
@@ -345,7 +345,8 @@ def number_or(value, default):
 # The 3D page's settings that the game saves to bbport.ini as well (its keys and Insert menu write
 # the file at once): before a start the file gets the page's values, after the game the page takes
 # the file's (adopt_stereo_ini), so a value changed in the game is kept.
-STEREO_INI_KEYS = ('stereo', 'stereo_output', 'stereo_depth', 'stereo_convergence', 'stereo_swap')
+STEREO_INI_KEYS = ('stereo', 'stereo_output', 'stereo_depth', 'stereo_convergence',
+                   'stereo_auto_convergence', 'stereo_auto_bias', 'stereo_swap')
 
 
 # The display settings the stereo 3D modes were tested with (D:\PC Port\Uncharted-3D\Uncharted-3D.ps1):
@@ -384,6 +385,8 @@ def stereo_ini_values(s):
             'stereo_output': str(s.get('stereo_output') or 'sr'),
             'stereo_depth': f"{number_or(s.get('stereo_depth'), 1.0):.2f}",
             'stereo_convergence': f"{number_or(s.get('stereo_convergence'), 3.0):.3f}",
+            'stereo_auto_convergence': '1' if s.get('stereo_auto_convergence') else '0',
+            'stereo_auto_bias': f"{number_or(s.get('stereo_auto_bias'), 1.0):.3f}",
             'stereo_swap': '1' if s.get('stereo_swap') else '0'}
 
 
@@ -408,7 +411,7 @@ def adopt_stereo_ini(s):
             if value not in [v for v, _t in STEREO_OUTPUTS]:
                 continue
             same = str(current) == value
-        elif key == 'stereo_swap':
+        elif key in ('stereo_swap', 'stereo_auto_convergence'):
             value = value not in ('0', '', 'false')
             same = bool(current) == value
         else:
@@ -649,6 +652,8 @@ def game_environment(s, start=None):
     env['BB_STEREO_OUTPUT'] = str(s.get('stereo_output') or 'sr')
     env['BB_STEREO_DEPTH'] = str(s.get('stereo_depth') or '1.0')
     env['BB_STEREO_CONVERGENCE'] = str(s.get('stereo_convergence') or '3.0')
+    env['BB_STEREO_AUTO_CONVERGENCE'] = '1' if s.get('stereo_auto_convergence') else '0'
+    env['BB_STEREO_AUTO_BIAS'] = str(s.get('stereo_auto_bias') or '1.0')
     env['BB_STEREO_SWAP'] = '1' if s.get('stereo_swap') else '0'
     try:
         write_stereo_ini(s)  # the game's own saves (keys, Insert menu) build on these values
@@ -1568,7 +1573,14 @@ class Launcher:
                  Slider(self.tk, self.target(f), self.var('stereo_convergence'), 0.1, 100.0, 0.1, COLORS, self.px,
                         self.font_ui_md, width=300, log=True, entry=True, suffix=' m'),
                  _('The distance (metres) shown at the screen\'s depth: nearer things come out of the screen, '
-                   'farther ones go in. In the game: Ctrl+F7 / Ctrl+F8.'))
+                   'farther ones go in. In the game: Ctrl+F7 / Ctrl+F8. With the automatic convergence, '
+                   'the value it starts from.'))
+        self.check(f, 'stereo_auto_convergence', _('Automatic convergence'),
+                   _('The nearest thing in the picture is kept at the screen\'s depth, so nothing comes out in '
+                     'front of the screen (uncomfortable where the edge of the picture cuts it), and the '
+                     'convergence follows the scene as the camera moves: nearer at once, farther slowly. '
+                     'In the game: Ctrl+F4 on/off; Ctrl+F7 / Ctrl+F8 then move the nearest thing a little in '
+                     'front of or behind the screen.'))
         self.check(f, 'stereo_swap', _('Swap the eyes'),
                    _('When the picture looks inside out. In the game: Ctrl+F9.'))
         self.note(f, _('In the game, Ctrl+F3 switches 3D off and on, Insert opens the settings menu with the same '

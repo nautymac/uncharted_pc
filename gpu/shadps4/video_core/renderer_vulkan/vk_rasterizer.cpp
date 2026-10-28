@@ -33,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/renderer_vulkan/vk_stereo_autoconv.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -210,6 +211,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     camera_motion->SetObjectMotion(object_motion.get());
     upscaler = std::make_unique<TemporalUpscaler>(instance, scheduler, texture_cache, runtime,
                                                   *camera_motion, *scene_targets);
+    stereo_autoconv =
+        std::make_unique<StereoAutoConvergence>(instance, scheduler, runtime, texture_cache);
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -1474,6 +1477,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
          BbToggle::Disabled(BbToggle::OneFrameStart))) {
         frame_display_address = regs.color_buffers[0].Address();
         scene_started = false;
+        // bbport: stereo 3D auto convergence: this frame's depth and camera are complete.
+        stereo_autoconv->OnDisplayPass(*camera_motion);
         camera_motion->OnDisplayPass(cb_descs[0].first);
         if (upscaler->OnFrameStart()) {
             object_motion->InvalidateHistory();
@@ -3859,8 +3864,11 @@ void Rasterizer::SetStereoPushData(bool both_eyes) {
     // corrections, stereo_unshift_pass.cpp, then change nothing).
     const auto& s = BbSettings::Get();
     const float sign = s.stereo_swap ? -1.0f : 1.0f;
+    // The automatic convergence (vk_stereo_autoconv.h) is latched at the display pass; the
+    // fixed value otherwise (also without a camera, when the display pass is not seen).
     push_data.stereo = {both_eyes ? sign * s.stereo_depth.load() / 100.0f : 0.0f,
-                        s.stereo_convergence.load()};
+                        s.stereo_auto_convergence ? s.stereo_convergence_live.load()
+                                                  : s.stereo_convergence.load()};
     push_data.stereo_eye = 0;
     push_data.stereo_pad = 0;
 }

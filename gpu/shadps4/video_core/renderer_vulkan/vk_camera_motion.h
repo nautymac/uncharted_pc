@@ -70,6 +70,10 @@ public:
     [[nodiscard]] VideoCore::ImageId Depth() const noexcept {
         return depth_id;
     }
+    /// bbport: this frame's view depth from the scene depth, z = b / (depth - a), as {a, b}
+    /// (the velocity pass's constants, else the scene constants' projection); b is 0 without
+    /// a camera this frame. For the stereo auto convergence (vk_stereo_autoconv.h).
+    [[nodiscard]] std::array<float, 2> DepthToView() const noexcept;
     /// The render size in the scene constants (the game's viewport; its targets may be
     /// allocated larger, e.g. 1916x1080 for a 1916x1078 scene), or zero before the first camera.
     [[nodiscard]] std::array<u32, 2> RenderSize() const noexcept {

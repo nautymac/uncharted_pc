@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: stereo 3D automatic convergence (vk_stereo_autoconv.h): the nearest view depth in
+// each tile of a grid over the scene depth, one work group per tile. The depth is linearized
+// with the game's own mapping z = b / (depth - a) (the velocity pass's constants), so the
+// result is in the units of the convergence (clip w). Depths at the near plane (full-screen 2D
+// elements, loading screens) and at the far plane (empty sky, a cleared buffer) are no content
+// and are skipped; a tile without a valid depth gets 1e30.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D depth_tex;
+layout(binding = 1, std430) writeonly buffer Tiles { float nearest[]; };
+
+layout(push_constant) uniform Constants {
+    ivec2 origin; // the sampled region of the depth, texels
+    ivec2 size;
+    ivec2 grid;   // tiles across and down
+    float depth_a;
+    float depth_b;
+    float z_min;  // just beyond the near plane
+    float z_max;  // just before the far plane (1e30 for an infinite one)
+};
+
+shared float group_nearest[64];
+
+void main() {
+    const ivec2 tile = ivec2(gl_WorkGroupID.xy);
+    const ivec2 first = origin + tile * size / grid;
+    const ivec2 last = origin + (tile + 1) * size / grid; // exclusive
+    float best = 1e30;
+    for (int y = first.y + int(gl_LocalInvocationID.y); y < last.y; y += 8) {
+        for (int x = first.x + int(gl_LocalInvocationID.x); x < last.x; x += 8) {
+            const float d = texelFetch(depth_tex, ivec2(x, y), 0).r;
+            const float z = depth_b / (d - depth_a);
+            if (z > z_min && z < z_max && z < best) { // false for infinities and NaN
+                best = z;
+            }
+        }
+    }
+    const uint index = gl_LocalInvocationIndex;
+    group_nearest[index] = best;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (index < stride) {
+            group_nearest[index] = min(group_nearest[index], group_nearest[index + stride]);
+        }
+        barrier();
+    }
+    if (index == 0u) {
+        nearest[tile.y * grid.x + tile.x] = group_nearest[0];
+    }
+}

@@ -184,6 +184,15 @@ float CameraMotion::Near() const noexcept {
     return -current.proj[3] / current.proj[2];
 }
 
+std::array<float, 2> CameraMotion::DepthToView() const noexcept {
+    if (velocity_mode) {
+        return velocity_camera.valid ? velocity_camera.depth_to_z : std::array<float, 2>{};
+    }
+    // depth = zs + zo / z, so z = zo / (depth - zs).
+    return current.valid ? std::array<float, 2>{current.proj[2], current.proj[3]}
+                         : std::array<float, 2>{};
+}
+
 std::array<std::array<float, 4>, 3> CameraMotion::TaaDepthParameters() const noexcept {
     const auto transform = Multiply(previous.view, current.inv_view);
     return {current.proj, previous.proj,

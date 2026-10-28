@@ -160,27 +160,35 @@ void ShowStereoNotice() {
     auto& s = BbSettings::Get();
     static constexpr const char* modes[BbSettings::StereoCount] = {"3D off",
                                                                     "3D: one pass (multiview)"};
+    char convergence[64];
+    if (s.stereo_auto_convergence) {
+        std::snprintf(convergence, sizeof(convergence), "convergence %.2f m (auto, bias %.2f)",
+                      s.stereo_convergence_live.load(), s.stereo_auto_bias.load());
+    } else {
+        std::snprintf(convergence, sizeof(convergence), "convergence %.2f m",
+                      s.stereo_convergence.load());
+    }
     std::snprintf(stereo_notice_text, sizeof(stereo_notice_text),
-                  "%s      depth %.2f %% of the width      convergence %.2f m%s",
+                  "%s      depth %.2f %% of the width      %s%s",
                   modes[std::clamp(s.stereo.load(), 0, BbSettings::StereoCount - 1)],
-                  s.stereo_depth.load(), s.stereo_convergence.load(),
+                  s.stereo_depth.load(), convergence,
                   s.stereo_swap ? "      eyes swapped" : "");
     stereo_notice_start = std::chrono::steady_clock::now();
     stereo_notice_busy = true;
 }
 
-// Stereo 3D keys, menu open or not (Ctrl+F3, Ctrl+F5..F9): true when `key` is one. Every change
-// is shown (ShowStereoNotice) and saved to bbport.ini at once. A held key repeats at the system
-// rate: the toggles (F3, F9, F10) fire once, the values step at most ~6 times a second.
+// Stereo 3D keys, menu open or not (Ctrl+F3..F10): true when `key` is one. Every change is
+// shown (ShowStereoNotice) and saved to bbport.ini at once. A held key repeats at the system
+// rate: the toggles (F3, F4, F9, F10) fire once, the values step at most ~6 times a second.
 bool StereoKey(SDL_Keycode key, bool repeat) {
-    const bool stereo_key = key == SDLK_F3 || key == SDLK_F5 || key == SDLK_F6 || key == SDLK_F7 ||
-                            key == SDLK_F8 || key == SDLK_F9 || key == SDLK_F10;
+    const bool stereo_key = key == SDLK_F3 || key == SDLK_F4 || key == SDLK_F5 || key == SDLK_F6 ||
+                            key == SDLK_F7 || key == SDLK_F8 || key == SDLK_F9 || key == SDLK_F10;
     if (!stereo_key) {
         return false;
     }
     static std::chrono::steady_clock::time_point last_step{};
     const auto now = std::chrono::steady_clock::now();
-    if (repeat && (key == SDLK_F3 || key == SDLK_F9 || key == SDLK_F10 ||
+    if (repeat && (key == SDLK_F3 || key == SDLK_F4 || key == SDLK_F9 || key == SDLK_F10 ||
                    now - last_step < std::chrono::milliseconds(160))) {
         return true;
     }
@@ -190,17 +198,29 @@ bool StereoKey(SDL_Keycode key, bool repeat) {
     case SDLK_F3: // off -> geo -> off (geo draws flat unless chosen at start)
         s.stereo = (s.stereo + 1) % BbSettings::StereoCount;
         break;
+    case SDLK_F4: // automatic convergence from the scene depth (vk_stereo_autoconv.h)
+        s.stereo_auto_convergence = !s.stereo_auto_convergence;
+        break;
     case SDLK_F5:
         s.stereo_depth = std::max(0.0f, s.stereo_depth - 0.1f);
         break;
     case SDLK_F6:
         s.stereo_depth = std::min(10.0f, s.stereo_depth + 0.1f);
         break;
-    case SDLK_F7:
-        s.stereo_convergence = std::max(0.01f, s.stereo_convergence / 1.1f);
+    case SDLK_F7: // with the automatic convergence: its bias (the nearest thing nearer the
+                  // viewer above 1, behind the screen below 1)
+        if (s.stereo_auto_convergence) {
+            s.stereo_auto_bias = std::max(0.25f, s.stereo_auto_bias / 1.1f);
+        } else {
+            s.stereo_convergence = std::max(0.01f, s.stereo_convergence / 1.1f);
+        }
         break;
     case SDLK_F8:
-        s.stereo_convergence = std::min(1000.0f, s.stereo_convergence * 1.1f);
+        if (s.stereo_auto_convergence) {
+            s.stereo_auto_bias = std::min(4.0f, s.stereo_auto_bias * 1.1f);
+        } else {
+            s.stereo_convergence = std::min(1000.0f, s.stereo_convergence * 1.1f);
+        }
         break;
     case SDLK_F9:
         s.stereo_swap = !s.stereo_swap;
@@ -217,9 +237,11 @@ bool StereoKey(SDL_Keycode key, bool repeat) {
     default:
         return false;
     }
-    std::printf("Stereo 3D: %s, depth %.2f%%, convergence %.3f%s\n",
+    std::printf("Stereo 3D: %s, depth %.2f%%, convergence %.3f%s%s\n",
                 BbSettings::StereoName(s.stereo), s.stereo_depth.load(),
-                s.stereo_convergence.load(), s.stereo_swap ? ", eyes swapped" : "");
+                s.stereo_auto_convergence ? s.stereo_convergence_live.load()
+                                          : s.stereo_convergence.load(),
+                s.stereo_auto_convergence ? " (auto)" : "", s.stereo_swap ? ", eyes swapped" : "");
     ShowStereoNotice();
     BbSettings::Save();
     return true;
@@ -436,14 +458,33 @@ void Menu() {
          "difference between the eyes); the UI stays at screen depth. The layers exist only "
          "when 3D is set before the start (the launcher's 3D page or stereo=geo in bbport.ini), "
          "and the upscaler and frame generation are off while it is on. Keys: Ctrl+F3 on/off, "
-         "Ctrl+F5/F6 depth, Ctrl+F7/F8 convergence, Ctrl+F9 swap eyes.");
+         "Ctrl+F4 automatic convergence, Ctrl+F5/F6 depth, Ctrl+F7/F8 convergence (its bias "
+         "when automatic), Ctrl+F9 swap eyes.");
     ImGui::BeginDisabled(s.stereo == BbSettings::StereoOff);
     Slider("Depth (% of width)", s.stereo_depth, 0.0f, 5.0f);
+    ImGui::BeginDisabled(s.stereo_auto_convergence);
     float convergence = s.stereo_convergence;
     Store(s.stereo_convergence, convergence,
           ImGui::SliderFloat("Convergence", &convergence, 0.1f, 100.0f, "%.2f",
                              ImGuiSliderFlags_Logarithmic));
-    Hint("The view distance shown at screen depth: nearer comes out of the screen.");
+    ImGui::EndDisabled();
+    Hint("The view distance shown at screen depth: nearer comes out of the screen. With the "
+         "automatic convergence, the value it starts from.");
+    Checkbox("Automatic convergence", s.stereo_auto_convergence);
+    Hint("The nearest thing in the picture is kept at screen depth, so nothing comes out in "
+         "front of the screen (uncomfortable where the frame edge cuts it), and the convergence "
+         "follows the scene as the camera moves: nearer at once, farther slowly. Measured from "
+         "the scene depth a few frames back, never waiting for the GPU. Ctrl+F4.");
+    if (s.stereo_auto_convergence) {
+        float bias = s.stereo_auto_bias;
+        Store(s.stereo_auto_bias, bias,
+              ImGui::SliderFloat("Auto bias", &bias, 0.25f, 4.0f, "%.2f",
+                                 ImGuiSliderFlags_Logarithmic));
+        Hint("Multiplies the measured distance: 1 puts the nearest thing at the screen, above 1 "
+             "lets it come out a little, below 1 pushes everything behind the screen. "
+             "Ctrl+F7/F8.");
+        ImGui::Text("Convergence now: %.2f m", s.stereo_convergence_live.load());
+    }
     Checkbox("Swap eyes", s.stereo_swap);
     static const char* stereo_outputs[] = {"Side by side in the window", "SR panel (woven in the window)"};
     const int stereo_output = s.stereo_output;

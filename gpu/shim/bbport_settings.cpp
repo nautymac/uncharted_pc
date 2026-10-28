@@ -48,6 +48,10 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.stereo_depth = Clamp(f, 0.0f, 10.0f);
     } else if (key == "stereo_convergence") {
         v.stereo_convergence = Clamp(f, 0.01f, 1000.0f);
+    } else if (key == "stereo_auto_convergence") {
+        v.stereo_auto_convergence = i != 0;
+    } else if (key == "stereo_auto_bias") {
+        v.stereo_auto_bias = Clamp(f, 0.25f, 4.0f);
     } else if (key == "stereo_swap") {
         v.stereo_swap = i != 0;
     } else if (key == "stereo_output") {
@@ -142,6 +146,8 @@ void Load() {
         {"BB_FRAME_GEN", "frame_gen"},              {"BB_FRAME_GEN_MULTIPLIER", "frame_gen_multiplier"},
         {"BB_STEREO", "stereo"},                    {"BB_STEREO_DEPTH", "stereo_depth"},
         {"BB_STEREO_CONVERGENCE", "stereo_convergence"},
+        {"BB_STEREO_AUTO_CONVERGENCE", "stereo_auto_convergence"},
+        {"BB_STEREO_AUTO_BIAS", "stereo_auto_bias"},
         {"BB_STEREO_SWAP", "stereo_swap"},           {"BB_STEREO_OUTPUT", "stereo_output"},
     };
     for (const auto& [env, key] : env_keys) {
@@ -159,6 +165,7 @@ void Load() {
     v.startup_output_res = v.output_res;
     v.startup_live_resolution = v.live_resolution;
     v.startup_stereo = v.stereo;
+    v.stereo_convergence_live = v.stereo_convergence.load();
     if (v.stereo == StereoGeo && v.upscaler != UpscalerOff) {
         // The geo mode draws both eyes into the two layers of the scene targets; the temporal
         // upscalers and their reduced scene targets work on one layer.
@@ -256,8 +263,10 @@ void Save() {
                  v.frame_gen_multiplier.load());
     std::fprintf(file,
                  "stereo=%s\nstereo_depth=%.2f\nstereo_convergence=%.3f\n"
+                 "stereo_auto_convergence=%d\nstereo_auto_bias=%.3f\n"
                  "stereo_swap=%d\nstereo_output=%s\n",
                  StereoName(v.stereo), v.stereo_depth.load(), v.stereo_convergence.load(),
+                 int(v.stereo_auto_convergence.load()), v.stereo_auto_bias.load(),
                  int(v.stereo_swap.load()),
                  StereoOutputName(v.stereo_output));
     // Read by run.sh at start.
