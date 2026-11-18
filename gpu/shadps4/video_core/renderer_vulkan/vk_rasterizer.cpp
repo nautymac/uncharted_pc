@@ -636,7 +636,18 @@ void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
         return;
     }
     // Draws write the same buffers over and over: an entry for the range only moves on.
-    const u64 position = draw_pipe->Head();
+    // bbport (Mevlock, U2 chapter 1 train flash): Head() is where the packet being prepared
+    // starts, and Reached(Head()) holds as soon as the packet before it has run. A write noted by
+    // PostDraw before its packet is committed (a draw's or dispatch's written resources) counted
+    // as done while that packet had not run: a copy shader the recording thread runs on the CPU
+    // wrote a material constant after stage A had walked the resource tables holding it into a
+    // later draw, and the train's platform flashed white for a frame. One past the start: done
+    // once this packet has run. BB_PENDING_NOTE_FIX=0: as before.
+    static const bool note_fix = [] {
+        const char* env = std::getenv("BB_PENDING_NOTE_FIX");
+        return !(env && env[0] == '0');
+    }();
+    const u64 position = draw_pipe->Head() + (note_fix && notes_before_commit ? 1 : 0);
     const VAddr end = address + size;
     for (auto& write : pending_writes) {
         if (address <= write.end && write.begin <= end) {
@@ -750,20 +761,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     }
     std::array<u16, AmdGpu::RegDirty::NumBlocks> blocks;
     u32 num_blocks = 0;
-#ifdef __GLIBCXX__
-    for (size_t block = dirty.blocks._Find_first(); block < dirty.blocks.size();
-         block = dirty.blocks._Find_next(block)) {
-        blocks[num_blocks++] = static_cast<u16>(block);
-    }
-#else
-    if (dirty.blocks.any()) {
-        for (size_t block = 0; block < dirty.blocks.size(); ++block) {
-            if (dirty.blocks.test(block)) {
-                blocks[num_blocks++] = static_cast<u16>(block);
-            }
-        }
-    }
-#endif
+    dirty.ForEachBlock([&](u32 block) { blocks[num_blocks++] = static_cast<u16>(block); });
     const auto stages =
         pipeline ? pipeline->GetStages() : std::span<const Shader::Info* const>{};
     // Constants: copied here into the ring, the recording thread only binds them.
@@ -773,6 +771,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     u32 num_stages = 0;
     u32 size = sizeof(DrawPacket) + AlignPacket(num_blocks * sizeof(u16)) +
                num_blocks * AmdGpu::RegDirty::BlockWords * sizeof(u32);
+    notes_before_commit = true;
     for (const auto* stage : stages) {
         if (stage) {
             auto& ring = rings[num_stages];
@@ -879,6 +878,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     }
     dirty.Clear();
     draw_pipe->Commit(static_cast<u32>(out - start));
+    notes_before_commit = false;
     PrintPipeStats();
 }
 
@@ -1122,6 +1122,7 @@ bool Rasterizer::FilterDrawPasses() const {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* prepared) {
     RENDERER_TRACE;
+    MaybeSubmitEarly();
     BbStats::draws.fetch_add(1, std::memory_order_relaxed);
 
     // bbport: with the draw pipeline this thread only selects the pipeline and hands the draw
@@ -1326,6 +1327,12 @@ const char* LiveShaderDebugFile() {
 LiveShaderDebug& LiveDebug() {
     static LiveShaderDebug state;
     const char* path = LiveShaderDebugFile();
+    // Called for every draw (SkipShader): the clock is read once every 256 calls of a thread
+    // (U1 chapter 2: QueryPerformanceCounter per draw was 1.6% of the draw recording thread).
+    static thread_local u32 calls = 0;
+    if (!path || (++calls & 255) != 1) {
+        return state;
+    }
     const s64 now = std::chrono::steady_clock::now().time_since_epoch().count();
     if (!path || now < state.next_read_ns.load(std::memory_order_relaxed) ||
         !state.read_mutex.try_lock()) {
@@ -1772,8 +1779,26 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
     draw_jitter = {};
+    // bbport (Mevlock): a draw of up to 6 indices is usually a full-screen quad (not jittered), but
+    // a quad that writes depth or tests it for equality is scene geometry: U3's chateau wall panels
+    // are single quads. Left unjittered, they sat a fraction of a pixel off their jittered
+    // neighbours and the seams opened into pinholes showing the scene colour's clear (0, 0, 1, 0):
+    // rows of bright blue dots, only with an upscaler on. BB_JITTER_SMALL=0: off.
+    static const bool jitter_small = [] {
+        const char* env = std::getenv("BB_JITTER_SMALL");
+        return !(env && env[0] == '0');
+    }();
+    const auto small_scene_geometry = [&] {
+        if (!jitter_small || !regs.depth_control.depth_enable) {
+            return false;
+        }
+        // Full-screen depth copies and resolves write depth with an always-passing test: not these.
+        const auto func = LiverpoolToVK::CompareOp(regs.depth_control.depth_func);
+        return func != vk::CompareOp::eAlways &&
+               (bool(regs.depth_control.depth_write_enable) || func == vk::CompareOp::eEqual);
+    };
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth() &&
-        (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
+        (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1 || small_scene_geometry())) {
         draw_jitter = upscaler->Jitter();
     } else if (const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
                ps && upscaler->Enabled() && JitterFullScreenPass(ps->pgm_hash)) {
@@ -1859,6 +1884,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
+    MaybeSubmitEarly();
     // bbport: like direct draws, handed to the recording thread after the pipeline selection
     // (else the GPU thread waited here for a whole frame of queued draws).
     const bool pipelined = UseDrawPipe() && FilterDrawPasses() &&
@@ -2028,13 +2054,132 @@ void Rasterizer::NoteSmallWrittenBuffers(const Shader::Info& stage) {
     }
 }
 
+namespace {
+/// BB_COPY64_EOP_READBACK=1 (run.py: on in Uncharted 3), from drakolordx7's community build, based
+/// on BilalReloaded's GOW3_COPY64_EOP_READBACK. The 64-dword copy shader 6a6422a9 (the scalar copy
+/// HLE, vk_shader_hle.cpp) moves the mesh raycaster results into the record arrays the game's CPU
+/// code reads. Where its source holds GPU-written bytes it runs on the GPU only unless
+/// BB_SCALAR_COPY64_SYNC asks for a guest copy (off in U3: 94 -> 54 FPS), so the guest read stale
+/// records: U3 characters sank into the ground, NPCs floated and legs twitched (#727, #745, #751).
+/// With this on, only the dwords such a dispatch writes (i < min(groups * 64, user data 6,
+/// records)) are read back, and only copies of 64 KiB or less (the game reads values in 0.5-1 KiB
+/// blocks; its two large copies a frame are never read): they land on the landing thread once the
+/// GPU is done (Copy64Gated: the next end-of-pipe label waits for them).
+constexpr u64 Copy64ShaderHash = 0x6a6422a9;
+constexpr u64 Copy64ReadbackMax = 64_KB;
+constexpr size_t Copy64ReadbackRanges = 256; ///< per end-of-pipe event
+
+bool Copy64Gated();
+
+bool Copy64EopReadback() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_COPY64_EOP_READBACK");
+        const bool enabled = env && env[0] == '1';
+        if (enabled) {
+            std::printf("COPY64EOP: on: what copy shader 6a6422a9 writes, up to 64 KiB a "
+                        "dispatch, lands in guest memory once the GPU is done (%s)\n",
+                        Copy64Gated() ? "the end-of-pipe label waits for it"
+                                      : "the label does not wait; BB_COPY64_EOP_GATE=1 to wait");
+            std::fflush(stdout);
+        }
+        return enabled;
+    }();
+    return on;
+}
+
+/// BB_COPY64_EOP_GATE=1: the end-of-pipe label waits for these landings (exact timing, but the
+/// game then waits for the GPU every frame: U3 market 88 -> 66 FPS). Default: they land as soon
+/// as the GPU is done, without holding the label.
+bool Copy64Gated() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_COPY64_EOP_GATE");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+} // namespace
+
+bool Rasterizer::NoteCopy64Readback(const Shader::Info& stage) {
+    if (stage.pgm_hash != Copy64ShaderHash || !Copy64EopReadback() || stage.buffers.size() != 2) {
+        return false;
+    }
+    const auto ud = stage.UserData();
+    if (ud.size() <= 6) {
+        return false;
+    }
+    // dst[i] = src[i] for i < min(groups * 64, ud[6]); writes past dst's records are dropped.
+    const auto dst = stage.buffers[1].GetSharp(stage);
+    if (dst.GetStride() != 4 || !dst.base_address) {
+        return false;
+    }
+    const u64 count = std::min<u64>({u64(CsRegs().dim_x) * 64, u64(ud[6]), u64(dst.num_records)});
+    const u64 size = count * 4;
+    if (size == 0 || size > Copy64ReadbackMax) {
+        return false;
+    }
+    std::scoped_lock lk{small_written_mutex};
+    for (const auto& [address, bytes] : copy64_readbacks) {
+        if (address == dst.base_address && bytes == size) {
+            return true;
+        }
+    }
+    if (copy64_readbacks.size() >= Copy64ReadbackRanges) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true, std::memory_order_relaxed)) {
+            std::printf("COPY64EOP: more than %zu copies before an end-of-pipe event, the rest "
+                        "not read back\n", Copy64ReadbackRanges);
+        }
+        return false;
+    }
+    copy64_readbacks.emplace_back(dst.base_address, static_cast<u32>(size));
+    return Copy64Gated();
+}
+
 void Rasterizer::ReadBackSmallWrittenBuffers() {
     std::vector<std::pair<VAddr, u32>> ranges;
+    std::vector<std::pair<VAddr, u32>> copy64;
     {
         std::scoped_lock lk{small_written_mutex};
         ranges.swap(small_written_buffers);
+        copy64.swap(copy64_readbacks);
     }
+    // The read back waits for the whole GPU queue (U3 pub: 27 instead of 46 FPS with the other
+    // run of the pair at the same time). The bytes land on the landing thread instead, once the
+    // work that wrote them is done, and the end-of-pipe label waits for them (landing_gate.h):
+    // the guest sees the same data in the same order without a thread waiting for the GPU.
+    // BB_READBACK_SMALL_DEFER=0: wait here as before.
+    static const bool defer = [] {
+        const char* env = std::getenv("BB_READBACK_SMALL_DEFER");
+        return !(env && env[0] == '0');
+    }();
+    // Gated: the end-of-pipe label waits for the landing, i.e. for the GPU to finish that work
+    // (the guest then never reads it early, but loses the overlap with the GPU: U3 pub 46 of 60
+    // FPS). Default: the bytes land when the GPU is done and the label does not wait.
+    // BB_READBACK_SMALL_GATE=1: gated.
+    static const bool gated = [] {
+        const char* env = std::getenv("BB_READBACK_SMALL_GATE");
+        return env && env[0] == '1';
+    }();
     for (const auto& [address, size] : ranges) {
+        if (defer) {
+            if (!buffer_cache.IsRangeGpuWritten(address, size)) {
+                continue; // none of these bytes is GPU data, the guest copy is current
+            }
+            if (buffer_cache.DeferGuestCopy(address, address, size, false, gated)) {
+                continue;
+            }
+        }
+        buffer_cache.ReadMemory(address, size, false, true);
+    }
+    // BB_COPY64_EOP_READBACK (NoteCopy64Readback): gated with BB_COPY64_EOP_GATE=1.
+    static const bool copy64_gated = Copy64Gated();
+    for (const auto& [address, size] : copy64) {
+        if (!buffer_cache.IsRangeGpuWritten(address, size)) {
+            continue; // nothing GPU-written there: the guest copy is current
+        }
+        if (defer && buffer_cache.DeferGuestCopy(address, address, size, false, copy64_gated)) {
+            continue;
+        }
         buffer_cache.ReadMemory(address, size, false, true);
     }
 }
@@ -2126,6 +2271,8 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         return;
     }
     NoteSmallWrittenBuffers(cs);
+    // Gated (BB_COPY64_EOP_GATE=1): submitted at once below, so the landing waits for this dispatch alone.
+    const bool copy64_readback = NoteCopy64Readback(cs);
     if (StaleCheckEnabled()) {
         VAddr slot = ~VAddr{0};
         u64 slot_size = 0;
@@ -2254,7 +2401,16 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     pipeline->BindResources(set_writes, push_data);
 
     const vk::Pipeline handle = pipeline->Handle();
-    const u32 dim_x = cs_program.dim_x, dim_y = cs_program.dim_y, dim_z = cs_program.dim_z;
+    // bbport: workgroups compiled as smaller ones (Shader::WorkgroupSplit): that many times the
+    // workgroups in X.
+    const Shader::HwComputeRuntimeInfo hw_cs = {
+        .workgroup_size = {cs_program.num_thread_x.full, cs_program.num_thread_y.full,
+                           cs_program.num_thread_z.full},
+        .indirect = false,
+    };
+    const u32 workgroup_split = Shader::WorkgroupSplit(cs.cs_split_eligible, hw_cs);
+    const u32 dim_x = cs_program.dim_x * workgroup_split, dim_y = cs_program.dim_y,
+              dim_z = cs_program.dim_z;
     if (FrameCapture::Active()) {
         FrameCapture::Dispatch(cs.pgm_hash, dim_x, dim_y, dim_z);
     }
@@ -2308,6 +2464,9 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     ResetBindings(true);
     scheduler.KickRecording();
+    if (copy64_readback) {
+        scheduler.Flush();
+    }
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -2317,7 +2476,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (!pipelined) {
         DrainDrawPipe();
     }
-    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline(true);
     if (!pipeline) {
         return;
     }
@@ -2387,7 +2546,47 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     scheduler.KickRecording();
 }
 
+void Rasterizer::MaybeSubmitEarly() {
+    // bbport (from the Bloodborne port, 5571243 and 453c6c5): the GPU thread submitted a frame's
+    // work once, at its end, so the GPU began only after the whole frame was recorded, and the
+    // read backs of Uncharted 2's fixes waited for all of it. Now what is recorded goes at least
+    // every millisecond and 48 draws. Off on AMD, where it was slower in Bloodborne (RX 9070 XT:
+    // 106 -> 90 FPS); BB_EARLY_SUBMIT=force turns it on there too, 0 off everywhere. On by
+    // default: U3 Cartagena square (RTX 5080) 94.7 -> 102.4 FPS median, slowest 5 s 59.7 -> 94.3;
+    // U2 on an RTX 4070 Laptop 56.3 -> 67.9 (mato215).
+    static const bool enabled = [this] {
+        const char* env = std::getenv("BB_EARLY_SUBMIT");
+        const bool force = env && std::strcmp(env, "force") == 0;
+        if (env && env[0] == '0') {
+            std::printf("Early submit: off (BB_EARLY_SUBMIT=0)\n");
+            return false;
+        }
+        if (instance.GetVendorID() == 0x1002 && !force) {
+            std::printf("Early submit: off on AMD (slower there; BB_EARLY_SUBMIT=force turns it on)\n");
+            return false;
+        }
+        std::printf("Early submit: on\n");
+        return true;
+    }();
+    if (!enabled) {
+        return;
+    }
+    // At least a millisecond of recording and a few draws per part: each submission waits for
+    // the recording thread, so many small ones would cost more than the GPU gains.
+    constexpr u32 MinDraws = 48;
+    constexpr auto MinTime = std::chrono::microseconds(1000);
+    if (++draws_since_submit < MinDraws) {
+        return;
+    }
+    if (std::chrono::steady_clock::now() - last_submit < MinTime) {
+        return;
+    }
+    Flush();
+}
+
 u64 Rasterizer::Flush() {
+    draws_since_submit = 0;
+    last_submit = std::chrono::steady_clock::now();
     DrainDrawPipe();
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};
@@ -2891,7 +3090,16 @@ void Rasterizer::ResetBindings(bool is_compute) {
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
+    // bbport (UntrackedStreamReads): the stream buffer is written by the host only, at a new
+    // offset every time, and never by the GPU; its reads need no barrier tracking (U1 chapter 2:
+    // the read inserts were ~7% of the draw recording thread).
+    const VideoCore::Buffer* stream =
+        BbToggle::Disabled(BbToggle::UntrackedStreamReads) ? nullptr
+                                                           : &buffer_cache.GetStreamBuffer();
     for (const auto [buffer, offset, size, is_written] : bound_buffers) {
+        if (buffer == stream && !is_written) {
+            continue;
+        }
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
         const auto write_flag =
@@ -3252,7 +3460,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
-                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                // The stream buffer holds no GPU writes (UntrackedStreamReads, ResetBindings).
+                if (desc.is_written || BbToggle::Disabled(BbToggle::UntrackedStreamReads) ||
+                    buffer != &buffer_cache.GetStreamBuffer()) {
+                    needs_barrier |=
+                        runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                }
                 if (const VAddr watch = WatchedGpuWrite();
                     watch && desc.is_written && vsharp.base_address < watch + 0x1000 &&
                     watch < vsharp.base_address + size) {
@@ -3481,10 +3694,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         }
 
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
-        // Same as image_desc.NumBindings(stage), without fetching the T# again.
+        // Same as image_desc.NumBindings(stage), without fetching the T# again. Levels reversed (a
+        // broken T#): 1, not the ~4e9 the unsigned difference gives (BilalReloaded's port 0.8.3, via
+        // El Dorado 778cc70c; like layout_count above).
         const u32 num_bindings =
             mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex
-                ? static_cast<u32>(tsharp.last_level - tsharp.base_level + 1)
+                ? Shader::ImageResource::MipBindingCount(tsharp)
                 : 1u;
         const bool proxy_candidate = sample_proxies && num_bindings == 1 &&
                                      !image_desc.needs_native && !image_desc.is_written &&
@@ -3645,9 +3860,29 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                     const auto new_layout = image.info.props.is_depth
                                                 ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
-                    barrier |= runtime.Transit(
-                        &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
-                        vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
+                    // bbport: a depth image sampled while it is this draw's depth target keeps the
+                    // attachment's stages and accesses in its state: recorded as a shader read only,
+                    // the render pass's depth/stencil store was lost to the next barrier, which then
+                    // waited for shader reads alone (sync validation: WRITE_AFTER_WRITE on the layout
+                    // transition after vkCmdEndRendering, READ_AFTER_WRITE on the next pass's depth
+                    // load; U3's 1720x720 half-resolution depth at 3440x1440, every frame).
+                    // BB_DEPTH_TARGET_STATE=0: as before (A/B).
+                    static const bool depth_target_state = [] {
+                        const char* env = std::getenv("BB_DEPTH_TARGET_STATE");
+                        return !(env && env[0] == '0');
+                    }();
+                    const bool depth_target = depth_target_state && image.info.props.is_depth && binding.is_target;
+                    const auto stage = depth_target
+                                           ? vk::PipelineStageFlagBits2::eAllCommands |
+                                                 vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                                 vk::PipelineStageFlagBits2::eLateFragmentTests
+                                           : vk::PipelineStageFlags2(vk::PipelineStageFlagBits2::eAllCommands);
+                    const auto access = depth_target
+                                            ? vk::AccessFlagBits2::eShaderRead |
+                                                  vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                                  vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+                                            : vk::AccessFlags2(vk::AccessFlagBits2::eShaderRead);
+                    barrier |= runtime.Transit(&image, new_layout, stage, access, desc.view_info.range);
                 }
             }
             image.usage.storage |= is_storage;
@@ -3954,6 +4189,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         signature = MakeBeginSignature(pipeline);
         const auto& regs = Regs();
         bool usable = begin_memo.valid && scheduler.IsRenderingWith(begin_memo.state) &&
+                      begin_memo.meta_clears == texture_cache.MetaClears() &&
                       !regs.depth_render_control.depth_clear_enable &&
                       !regs.depth_render_control.stencil_clear_enable &&
                       signature == begin_memo.signature;
@@ -3984,7 +4220,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         if (!clears) {
             // Recomputed after the full path: it may have started the scene (scene_started).
             begin_memo = {true, MakeBeginSignature(pipeline), state, push_data.scene_size,
-                          target_scale};
+                          target_scale, texture_cache.MetaClears()};
         }
     }
     return state;

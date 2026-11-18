@@ -22,18 +22,23 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "bbport_focus_fix.h"
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 12u; // bbport: motion shaders hold address stand-ins (10); scalar instructions split EXEC scopes (11); stereo_unshift moves a product once (12: the pipelines preloaded past a ShaderMeta change kept the old SPIR-V)
-static constexpr u32 ShaderMetaVersion = 12u; // bbport: stereo_unshift moves a product once, the depth operand free of the coordinate
-static constexpr u32 PipelineKeyVersion = 6u; // bbport: GraphicsPipelineKey::stereo
+static constexpr u32 ShaderBinaryVersion = 13u; // bbport: motion shaders hold address stand-ins (10); scalar instructions split EXEC scopes (11); WorkgroupSplit and the stereo_unshift move (12 on both sides); merged (13)
+static constexpr u32 ShaderMetaVersion = 13u; // bbport: InfoPersistent::cs_split_eligible (upstream 8) and stereo_unshift moving a product once (stereo 12); merged (13)
+static constexpr u32 PipelineKeyVersion = 7u; // bbport: Info layout (cs_split_eligible) and GraphicsPipelineKey::stereo (6 on both sides); merged (7)
 /// bbport (BilalReloaded): the cache name of a shader's SPIR-V. Shaders that gained multi-wave
 /// LDS barriers get a new name, so their binaries cached before the fix are not found and only
 /// those shaders recompile.
+/// Shaders with a clamped loop bound (BB_EFFECT_LOOP_CLAMP) get their own names too.
 static std::string ShaderBinaryName(u64 pgm_hash, size_t perm_idx) {
-    return fmt::format("{:#018x}_{}{}", pgm_hash, perm_idx,
-                       Shader::Optimization::MultiwaveLdsBarriers(pgm_hash) ? "_lds4" : "");
+    const char* clamp = !Shader::Optimization::EffectLoopClamp(pgm_hash) ? ""
+                        : pgm_hash == 0x689d1af9                       ? "_lc2"
+                                                                       : "_lc1";
+    return fmt::format("{:#018x}_{}{}{}", pgm_hash, perm_idx,
+                       Shader::Optimization::MultiwaveLdsBarriers(pgm_hash) ? "_lds4" : "", clamp);
 }
 } // namespace Serialization
 
@@ -407,7 +412,8 @@ void PipelineCache::WarmUpThread() {
         stage.spec.info = &stage.program->info;
         std::optional<Shader::Gcn::FetchShaderData> unused;
         if (!LoadShaderMeta(meta_ar, stage.program->info, unused, stage.spec, stage.perm_idx) ||
-            Shader::Backend::SPIRV::IsForcedShader(stage.program->info.pgm_hash)) {
+            Shader::Backend::SPIRV::IsForcedShader(stage.program->info.pgm_hash) ||
+            BbFocusFix::FocusCentreShader(stage.program->info.pgm_hash)) {
             stage.program.reset();
             return;
         }

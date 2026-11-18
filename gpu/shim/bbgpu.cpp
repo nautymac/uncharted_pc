@@ -34,6 +34,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/button_prompts.h"
+#include "video_core/renderer_vulkan/vk_low_latency.h"
 
 extern "C" {
 // runtime_memory.c
@@ -193,7 +194,22 @@ u32 BbDisplayRefreshHz() {
     return hz;
 }
 
-#ifdef BB_PGO_GENERATE
+#if defined(BB_PGO_GENERATE) && defined(BB_PGO_CLANG)
+extern "C" int __llvm_profile_write_file(void);
+// Instrumented clang build (perf7, BB_PGO=generate): the counters only grow, so each write replaces the file
+// (LLVM_PROFILE_FILE, a fixed name) with the totals so far; the game often ends without the exit-time write.
+static void StartProfileWriter() {
+    std::thread([] {
+        Common::SetCurrentThreadName("bb:pgo");
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            const int result = __llvm_profile_write_file();
+            std::printf("PGO: profile written (%d)\n", result);
+            std::fflush(stdout);
+        }
+    }).detach();
+}
+#elif defined(BB_PGO_GENERATE)
 extern "C" void __gcov_dump(void);
 extern "C" void __gcov_reset(void);
 // Instrumented build (BB_PGO=generate): the game often ends through _exit (watchdog, guest
@@ -351,11 +367,15 @@ static void KernelServiceThread(std::stop_token stoken) {
         {
             std::unique_lock lock{m_asio_req};
             cv_asio_req.wait(lock, stoken, [] { return asio_requests != 0; });
+            // bbport (from iannitram/Uncharted-Universal #35, 6c42c4d6): the requests are taken here, before the
+            // timers run. Cleared after run() as before, a request (a timer armed) landing between run() returning
+            // and the clear was lost: its timer waited for the next request (U3's Load Game hung on a handheld).
+            // One that lands while run() works keeps the count above 0, and the loop runs again.
+            asio_requests = 0;
         }
         if (stoken.stop_requested()) break;
         io_context.run();
         io_context.restart();
-        asio_requests = 0;
     }
 }
 
@@ -396,6 +416,14 @@ extern "C" void bbgpu_trophy_notify(int grade, const char* game, const char* nam
 
 extern "C" int bbgpu_overlay_captures_input(void) {
     return BbOverlay::CapturesInput() ? 1 : 0;
+}
+
+extern "C" void bbgpu_input_sample(void) {
+    Vulkan::LowLatency::InputSample();
+}
+
+extern "C" void bbgpu_prepare_exit(void) {
+    Vulkan::FlushPipelineCacheForExit();
 }
 
 extern "C" int bbgpu_text_input_begin(const char* initial, const char* prompt) {
