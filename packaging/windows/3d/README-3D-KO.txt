@@ -15,8 +15,11 @@
 
 1. https://github.com/nautymac/uncharted_pc 를 열고 맨 위의 "Download the latest version"을 누릅니다.
    원작 PC 포트 uncharted-windows.zip이 받아집니다.
-   이 3D 패키지는 원작 v0.3.9용입니다. 받은 버전이 0.3.9보다 새것이면 v0.3.9를 받으세요:
-   https://github.com/Supermedo/uncharted_pc/releases/tag/v0.3.9
+   이 3D 패키지는 원작 v0.3.15용입니다. 받은 버전이 0.3.15보다 새것이면 v0.3.15를 받으세요:
+   https://github.com/Supermedo/uncharted_pc/releases/tag/v0.3.15
+   예전 원작(0.3.9)에 이전 3D 패키지(3d.1~3d.5)를 쓰고 있었다면, 원작 v0.3.15 zip을 먼저 폴더에 덮어
+   풀고(세이브·설정은 유지됨) 그다음 이 zip을 푸세요. 런처의 Update 버튼은 3D 파일만 설치하므로 원작을
+   먼저 올려야 합니다.
 2. 같은 페이지 오른쪽의 Releases에서 uncharted-3d-windows.zip(이 패키지)을 받습니다.
 3. 두 zip을 같은 폴더에 풉니다. 3D zip을 나중에 풀고, 같은 이름의 파일은 모두 덮어씁니다:
    Uncharted.exe와 _internal\ 폴더(3D 페이지가 있는 런처), bin\ 폴더(3D 빌드 bb-probe.exe와 그것이

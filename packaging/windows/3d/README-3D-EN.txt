@@ -16,8 +16,11 @@ that one folder.
 
 1. Open https://github.com/nautymac/uncharted_pc and click "Download the latest version" at the top.
    That is the original PC port, uncharted-windows.zip.
-   This 3D add-on is made for the original v0.3.9. If the version you got is newer than 0.3.9, get
-   v0.3.9 instead: https://github.com/Supermedo/uncharted_pc/releases/tag/v0.3.9
+   This 3D add-on is made for the original v0.3.15. If the version you got is newer than 0.3.15, get
+   v0.3.15 instead: https://github.com/Supermedo/uncharted_pc/releases/tag/v0.3.15
+   Coming from an older original (0.3.9 with add-on 3d.1 to 3d.5): unpack the original v0.3.15 zip
+   over your folder first (saves and settings are kept), then this zip. The launcher's Update button
+   installs only the 3D files, so update the original first.
 2. On the same page, under Releases on the right, download uncharted-3d-windows.zip (this package).
 3. Unpack both zips into the same folder, the 3D zip second, overwriting every file of the same
    name: Uncharted.exe and the _internal\ folder (the launcher with the 3D page), the bin\ folder
